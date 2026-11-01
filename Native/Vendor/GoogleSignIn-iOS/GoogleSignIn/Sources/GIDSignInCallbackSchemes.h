@@ -1,0 +1,51 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#import <Foundation/Foundation.h>
+
+#import "GoogleSignIn/Sources/GIDBundle/API/GIDBundle.h"
+
+NS_ASSUME_NONNULL_BEGIN
+
+/// A utility class for dealing with callback schemes.
+@interface GIDSignInCallbackSchemes : NSObject
+
+/// Unavailable. Use `-initWithClientIdentifier:bundle:` or `-initWithClientIdentifier:`.
+- (instancetype)init NS_UNAVAILABLE;
+
+/// Creates an instance that validates the host app's URL schemes against `bundle`'s Info.plist.
+- (instancetype)initWithClientIdentifier:(NSString *)clientIdentifier
+                                  bundle:(id<GIDBundle>)bundle NS_DESIGNATED_INITIALIZER;
+
+/// Creates an instance that validates the host app's URL schemes against the main bundle's
+/// Info.plist.
+- (instancetype)initWithClientIdentifier:(NSString *)clientIdentifier;
+
+/// The canonical client identifier callback scheme. Requires clientId to be set on GIDSignIn.
+- (NSString *)clientIdentifierScheme;
+
+/// An array of all schemes used for sign-in callbacks.
+- (NSArray<NSString *> *)allSchemes;
+
+/// Returns a list of URL schemes the current app host should support for Google Sign-In to work.
+- (NSMutableArray<NSString *> *)unsupportedSchemes;
+
+/// Indicates the scheme of an NSURL is a sign-in callback scheme.
+- (BOOL)URLSchemeIsCallbackScheme:(NSURL *)URL;
+
+@end
+
+NS_ASSUME_NONNULL_END
