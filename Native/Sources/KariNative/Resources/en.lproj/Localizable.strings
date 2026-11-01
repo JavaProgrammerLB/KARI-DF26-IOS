@@ -35,11 +35,13 @@
 "密钥已删除" = "Key deleted";
 "%@（默认）" = "%@ (default)";
 "选择模型" = "Choose model";
+"语音音色" = "Voice";
 "输入或选择模型名称" = "Enter or choose a model";
 "语言" = "Language";
 "界面语言" = "App language";
 "跟随系统" = "System default";
 "AI 会优先使用你输入或说话的语言；界面语言只作为没有语言线索时的默认值。" = "AI follows the language you type or speak. The app language is only a fallback when no language is clear.";
+"智谱 GLM" = "Zhipu GLM";
 "通义千问 / 百炼" = "Qwen / Model Studio";
 "Ollama 本地模型" = "Ollama local models";
 "自定义兼容服务" = "Custom compatible service";
@@ -169,6 +171,7 @@
 "请先完成 Google 授权" = "Sign in with Google first.";
 "请在 AI 设置中填写 API Key" = "Enter an API Key in AI settings.";
 "Express 端点不支持当前实时路径，请选择标准项目" = "The Express endpoint does not support this Live connection. Select a standard project.";
+"当前提供商不支持实时语音" = "This provider does not support Live voice.";
 "实时连接中断：%@" = "Live connection interrupted: %@";
 "实时配置资源缺失，请重新构建" = "Live configuration is missing. Rebuild the app.";
 "实时会话准备超时，请检查网络与模型" = "Live session setup timed out. Check the network and model.";
@@ -484,7 +487,7 @@
 
 "重试实时 AI" = "Retry Live AI";
 
-"仅 Gemini／标准 Vertex 实时语音支持唤醒模式；文字模式保持原有方式。" = "Wake mode requires Gemini or standard Vertex Live. Text mode is unchanged.";
+"仅 Gemini／标准 Vertex／智谱实时语音支持唤醒模式；文字模式保持原有方式。" = "Wake mode requires Gemini, standard Vertex, or Zhipu Live. Text mode is unchanged.";
 
 "休眠时" = "While sleeping";
 

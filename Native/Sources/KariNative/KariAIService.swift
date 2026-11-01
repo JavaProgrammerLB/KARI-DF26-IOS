@@ -102,6 +102,7 @@ import GoogleSignIn
     private var previousWasTest = false
     private var previousLanguage: String?
     private var discardAudioUntilTurnComplete = false
+    private var wire: (any KariLiveWire)?
     init() { audio.activate = { try Self.activateAudio() } }
     private static func activateAudio() throws {
         let session = AVAudioSession.sharedInstance()
@@ -122,18 +123,8 @@ import GoogleSignIn
         do {
             let credential = try await KariCredentials.token(config)
             guard token == generation else { throw CancellationError() }
-            var url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-            var model = "models/\(try KariAIRequest.identifier(config.liveModel.replacingOccurrences(of: "models/", with: "")))"
-            if config.provider == "vertex" {
-                guard config.endpointType != "express" else { throw KariError.message("Express 端点不支持当前实时路径，请选择标准项目") }
-                let region = try KariAIRequest.identifier(config.region), project = try KariAIRequest.identifier(config.projectId)
-                let host = region == "global" ? "aiplatform.googleapis.com" : "\(region)-aiplatform.googleapis.com"
-                url = "wss://\(host)/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
-                model = "projects/\(project)/locations/\(region)/publishers/google/models/\(try KariAIRequest.identifier(config.liveModel))"
-            }
-            var request = URLRequest(url: URL(string: url)!)
-            request.setValue(config.auth == "oauth" ? "Bearer \(credential)" : credential, forHTTPHeaderField: config.auth == "oauth" ? "Authorization" : "x-goog-api-key")
-            let task = session.webSocketTask(with: request); task.maximumMessageSize = 4_000_000; socket = task; task.resume()
+            let wire = try config.liveWire(testOnly: testOnly); self.wire = wire
+            let task = session.webSocketTask(with: wire.connectRequest(credential: credential)); task.maximumMessageSize = 4_000_000; socket = task; task.resume()
             receiver = Task { [weak self] in
                 do {
                     while !Task.isCancelled {
@@ -146,30 +137,17 @@ import GoogleSignIn
                 } catch { guard let self, token == self.generation else { return }; self.transportFailed(error, socket: task, prefix: "实时连接中断") }
             }
             guard let setupURL = Bundle.module.url(forResource: "LiveSetup", withExtension: "json"),
-                  var wrapper = try JSONSerialization.jsonObject(with: Data(contentsOf: setupURL)) as? [String: Any],
-                  var payload = wrapper["setup"] as? [String: Any] else { throw KariError.message("实时配置资源缺失，请重新构建") }
-            payload = KariLiveConfiguration.setup(payload, model: model, testOnly: testOnly)
-            if !testOnly {
-                let instruction = payload["systemInstruction"] as? [String: Any] ?? [:]
-                var parts = instruction["parts"] as? [[String: Any]] ?? []
-                parts.append(["text": personality?() ?? ""])
-                if memoryAvailable?() == true {
-                    parts.append(["text": KariMemoryService.instruction + " Use search_memory with a self-contained query before answering document or personal-memory questions. State only references returned by that tool. Never read UUID citation IDs aloud; mention document names and locations instead."])
-                    var tools = payload["tools"] as? [[String: Any]] ?? []
-                    tools.append(["functionDeclarations": [["name": "search_memory", "description": "Search the user's imported memory documents; no physical actions.", "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "A self-contained search question"]], "required": ["query"]]]]])
-                    payload["tools"] = tools
-                }
-                payload["systemInstruction"] = ["parts": parts]
-            }
-            if let resumeHandle { payload["sessionResumption"] = ["handle": resumeHandle] }
-            wrapper["setup"] = payload
+                  let wrapper = try JSONSerialization.jsonObject(with: Data(contentsOf: setupURL)) as? [String: Any],
+                  let template = wrapper["setup"] as? [String: Any] else { throw KariError.message("实时配置资源缺失，请重新构建") }
+            let context = KariLiveSessionContext(personality: personality?() ?? "", memoryInstruction: memoryAvailable?() == true ? KariMemoryService.instruction : nil, resumeHandle: resumeHandle)
+            let setupMessage = wire.setupMessage(template: template, context: context)
             try await withCheckedThrowingContinuation { continuation in
                 setup = continuation
                 setupTimeout = Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 15_000_000_000)
                     guard !Task.isCancelled, let self, token == self.generation else { return }; self.fail("实时会话准备超时，请检查网络与模型")
                 }
-                enqueue(wrapper, token: token)
+                enqueue(setupMessage, token: token)
             }
             guard token == generation else { throw CancellationError() }
             connected = true; connecting = false
@@ -193,7 +171,7 @@ import GoogleSignIn
         guard allowed else { throw KariError.message("请在 iPhone 设置中允许 KARI 使用麦克风") }
         try audio.startMicrophone(onFrame: { [weak self] data, level in
             if let self, self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
-            self?.enqueue(["realtimeInput": ["audio": ["data": data.base64EncodedString(), "mimeType": "audio/pcm;rate=16000"]]], token: token)
+            self?.send(.audio(data), token: token)
         }, onState: { [weak self] type, message in
             guard let self, token == self.generation else { return }
             self.microphone = type == "started"
@@ -223,12 +201,16 @@ import GoogleSignIn
         // At most sixteen 500ms chunks for the bounded eight-second wake buffer.
         for offset in stride(from: 0, to: data.count, by: 16_000) {
             let chunk = data.subdata(in: offset..<min(data.count, offset + 16_000))
-            enqueue(["realtimeInput": ["audio": ["data": chunk.base64EncodedString(), "mimeType": "audio/pcm;rate=16000"]]], token: generation)
+            send(.audio(chunk), token: generation)
         }
     }
     func recoverMicrophone() async throws { audio.stopMicrophone(); microphone = false; guard connected else { return }; try await startMicrophone(token: generation) }
-    func sendFrame(_ jpeg: Data) { guard connected, queuedMessages < 6 else { return }; sentVideoFrames += 1; enqueue(["realtimeInput": ["video": ["data": jpeg.base64EncodedString(), "mimeType": "image/jpeg"]]], token: generation) }
-    func sendText(_ text: String) { guard connected else { return }; userUtterance = text; awaitingNewUserInput = false; processing = true; enqueue(["clientContent": ["turns": [["role": "user", "parts": [["text": text]]]], "turnComplete": true]], token: generation) }
+    func sendFrame(_ jpeg: Data) { guard connected, queuedMessages < 6 else { return }; sentVideoFrames += 1; send(.video(jpeg), token: generation) }
+    func sendText(_ text: String) { guard connected else { return }; userUtterance = text; awaitingNewUserInput = false; processing = true; send(.text(text), token: generation) }
+    private func send(_ command: KariLiveCommand, token: Int) {
+        guard let wire else { return }
+        for frame in wire.encode(command) { enqueue(frame, token: token) }
+    }
     private func enqueue(_ object: [String: Any], token: Int) {
         guard token == generation, let socket, let data = try? JSONSerialization.data(withJSONObject: object), let text = String(data: data, encoding: .utf8) else { return }
         guard queuedMessages < 48 else { fail("网络发送过慢，请检查网络后恢复连接"); return }
@@ -241,76 +223,73 @@ import GoogleSignIn
         }
     }
     private func receive(_ data: Data, token: Int) throws {
-        guard let message = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let failure = message["error"] as? [String: Any] { throw KariError.message(failure["message"] as? String ?? "AI 拒绝请求") }
-        if message["setupComplete"] != nil { setupTimeout?.cancel(); let continuation = setup; setup = nil; continuation?.resume() }
-        if let resume = message["sessionResumptionUpdate"] as? [String: Any], resume["resumable"] as? Bool != false, let handle = resume["newHandle"] as? String { resumeHandle = handle }
-        let content = message["serverContent"] as? [String: Any] ?? [:]
-        if content["interrupted"] as? Bool == true { onMemoryCancel?(); serverInterruptions += 1; playbackGeneration += 1; audio.stop(); audioBuffers = 0; speaking = false; discardAudioUntilTurnComplete = false }
-        if let transcription = content["inputTranscription"] as? [String: Any], let text = transcription["text"] as? String {
+        guard let wire, let message = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        for event in try wire.decode(message) { apply(event, token: token) }
+    }
+    private func apply(_ event: KariLiveEvent, token: Int) {
+        switch event {
+        case .ready: setupTimeout?.cancel(); let continuation = setup; setup = nil; continuation?.resume()
+        case .resumable(let handle): resumeHandle = handle
+        case .interrupted: onMemoryCancel?(); serverInterruptions += 1; playbackGeneration += 1; audio.stop(); audioBuffers = 0; speaking = false; discardAudioUntilTurnComplete = false
+        case .heard(let text):
             processing = true
             if awaitingNewUserInput { userUtterance = ""; awaitingNewUserInput = false }
             if userUtterance.count < 2000 { userUtterance += text }
             heard = String((heard + text).suffix(1500))
             if KariAIRequest.isStopRequest(text) { onImmediateStop?() }
-        }
-        if let transcription = content["outputTranscription"] as? [String: Any], let text = transcription["text"] as? String { reply = String((reply + text).suffix(3000)) }
-        if let model = content["modelTurn"] as? [String: Any], let parts = model["parts"] as? [[String: Any]] {
-            for part in parts {
-                guard !discardAudioUntilTurnComplete, let blob = part["inlineData"] as? [String: Any], let mime = blob["mimeType"] as? String, mime.hasPrefix("audio/pcm"),
-                      let encoded = blob["data"] as? String, let pcm = Data(base64Encoded: encoded) else { continue }
-                receivedPCMFrames += pcm.count / 2
-                audioBuffers += 1; if !speaking { speaking = true }; receivedAudioChunks += 1; turnComplete = false
-                let playback = playbackGeneration
-                do { try audio.enqueue(data: pcm, sampleRate: 24_000) { [weak self] result in
-                    guard let self, token == self.generation, playback == self.playbackGeneration else { return }
-                    self.audioBuffers = max(0, self.audioBuffers - 1)
-                    if self.speaking != (self.audioBuffers > 0) { self.speaking = self.audioBuffers > 0 }
-                    switch result {
-                    case .success: self.playedPCMFrames += pcm.count / 2
-                    case .failure(let error): self.playbackFailed(error)
-                    }
-                } } catch { playbackFailed(error) }
+            else if let name = KariMemoryActionPolicy.scenario(for: text), let run = onScenario {
+                Task { try? await run(name) }
             }
-        }
-        if content["generationComplete"] as? Bool == true { generationCompletions += 1 }
-        if content["turnComplete"] as? Bool == true { awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false }
-        if let tool = message["toolCall"] as? [String: Any], let calls = tool["functionCalls"] as? [[String: Any]] {
-            for call in calls {
-                if let id = call["id"] as? String {
-                    if call["name"] as? String == "search_memory" { memoryToolIDs.insert(id); memoryHasBeenUsed = true }
-                    if call["name"] as? String == "run_scenario" { scenarioToolIDs.insert(id) }
+        case .reply(let text): reply = String((reply + text).suffix(3000))
+        case .audio(let pcm):
+            guard !discardAudioUntilTurnComplete else { return }
+            receivedPCMFrames += pcm.count / 2
+            audioBuffers += 1; if !speaking { speaking = true }; receivedAudioChunks += 1; turnComplete = false
+            let playback = playbackGeneration
+            do { try audio.enqueue(data: pcm, sampleRate: 24_000) { [weak self] result in
+                guard let self, token == self.generation, playback == self.playbackGeneration else { return }
+                self.audioBuffers = max(0, self.audioBuffers - 1)
+                if self.speaking != (self.audioBuffers > 0) { self.speaking = self.audioBuffers > 0 }
+                switch result {
+                case .success: self.playedPCMFrames += pcm.count / 2
+                case .failure(let error): self.playbackFailed(error)
                 }
-            }
-            Task { [weak self] in
-                guard let self else { return }; var results: [[String: Any]] = []
-                for call in calls {
-                    guard token == self.generation else { return }
-                    let id = call["id"] as? String ?? ""
-                    if self.cancelledToolIDs.contains(id) { self.memoryToolIDs.remove(id); continue }
-                    var response: [String: Any] = ["ok": true]
-                    do {
-                        guard let args = call["args"] as? [String: Any] else { throw KariError.message("工具参数无效") }
-                        if call["name"] as? String == "search_memory" {
-                            guard let query = args["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, query.count <= 2000, let search = self.onMemorySearch else { throw KariError.message("记忆检索参数无效") }
-                            response["results"] = try await search(query)
-                        } else {
-                            guard call["name"] as? String == "run_scenario", let name = args["name"] as? String, let run = self.onScenario else { throw KariError.message("未知动作请求") }
-                            guard !self.memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(self.userUtterance) else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
-                            try await run(name)
-                        }
-                    } catch { response = ["ok": false, "reason": error.localizedDescription] }
-                    self.memoryToolIDs.remove(id)
-                    if !self.cancelledToolIDs.contains(id) { results.append(["id": id, "name": call["name"] ?? "run_scenario", "response": response]) }
-                }
-                guard token == self.generation, !results.isEmpty else { return }; self.enqueue(["toolResponse": ["functionResponses": results]], token: token)
-            }
-        }
-        if let cancellation = message["toolCallCancellation"] as? [String: Any] {
-            let ids = Set(cancellation["ids"] as? [String] ?? [])
+            } } catch { playbackFailed(error) }
+        case .generationComplete: generationCompletions += 1
+        case .turnComplete: awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
+        case .toolCalls(let calls): runTools(calls, token: token)
+        case .toolCancellation(let ids):
             cancelledToolIDs.formUnion(ids)
             if !ids.isDisjoint(with: memoryToolIDs) { onMemoryCancel?() }
             if !ids.isDisjoint(with: scenarioToolIDs) { onCancel?() }
+        }
+    }
+    private func runTools(_ calls: [KariLiveToolCall], token: Int) {
+        for call in calls {
+            if call.name == "search_memory" { memoryToolIDs.insert(call.id); memoryHasBeenUsed = true }
+            if call.name == "run_scenario" { scenarioToolIDs.insert(call.id) }
+        }
+        Task { [weak self] in
+            guard let self else { return }; var results: [KariLiveToolResult] = []
+            for call in calls {
+                guard token == self.generation else { return }
+                if self.cancelledToolIDs.contains(call.id) { self.memoryToolIDs.remove(call.id); continue }
+                var response: [String: Any] = ["ok": true]
+                do {
+                    guard let args = call.arguments else { throw KariError.message("工具参数无效") }
+                    if call.name == "search_memory" {
+                        guard let query = args["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, query.count <= 2000, let search = self.onMemorySearch else { throw KariError.message("记忆检索参数无效") }
+                        response["results"] = try await search(query)
+                    } else {
+                        guard call.name == "run_scenario", let name = args["name"] as? String, let run = self.onScenario else { throw KariError.message("未知动作请求") }
+                        guard !self.memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(self.userUtterance) else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
+                        try await run(name)
+                    }
+                } catch { response = ["ok": false, "reason": error.localizedDescription] }
+                self.memoryToolIDs.remove(call.id)
+                if !self.cancelledToolIDs.contains(call.id) { results.append(.init(id: call.id, name: call.name, response: response)) }
+            }
+            guard token == self.generation, !results.isEmpty else { return }; self.send(.toolResults(results), token: token)
         }
     }
     private func playbackFailed(_ failure: Error) {
@@ -345,7 +324,7 @@ import GoogleSignIn
         playbackGeneration += 1; cancelledToolIDs.removeAll()
         setupTimeout?.cancel(); ping?.cancel(); receiver?.cancel(); writer?.cancel(); writer = nil
         let continuation = setup; setup = nil; continuation?.resume(throwing: CancellationError())
-        socket?.cancel(with: .normalClosure, reason: nil); socket = nil
+        socket?.cancel(with: .normalClosure, reason: nil); socket = nil; wire = nil
         if preserveCapture { audio.stop() } else {
             endSharedCapture(); audio.shutdown(); try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }

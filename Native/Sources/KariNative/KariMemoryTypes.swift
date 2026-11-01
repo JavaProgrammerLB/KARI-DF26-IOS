@@ -150,4 +150,13 @@ enum KariMemoryActionPolicy {
         let english = "^(?:heykari|kari)?(?:please)?(?:moveforward|goforward|movebackward|gobackward|turnleft|turnright|spin|dance|wave|blink|smile)(?:abit|alittle|once|for[0-9]+seconds?)?(?:please)?$"
         return value.range(of: chinese, options: .regularExpression) != nil || value.range(of: english, options: .regularExpression) != nil
     }
+    static func scenario(for text: String) -> String? {
+        guard isDirectCommand(text) else { return nil }
+        let value = text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
+        let commands = [("向后走", "back_up"), ("后退", "back_up"), ("movebackward", "back_up"), ("gobackward", "back_up"),
+                        ("向前走", "come_closer"), ("前进", "come_closer"), ("moveforward", "come_closer"), ("goforward", "come_closer"),
+                        ("向左转", "look_left"), ("左转", "look_left"), ("turnleft", "look_left"),
+                        ("向右转", "look_right"), ("右转", "look_right"), ("turnright", "look_right")]
+        return commands.first { value.contains($0.0) }?.1
+    }
 }

@@ -24,11 +24,17 @@ struct KariSettingsView: View {
                     Picker(L("提供商"), selection: $draft.provider) {
                         ForEach(KariProvider.all) { provider in Text(L(provider.title)).tag(provider.id) }
                     }.onChange(of: draft.provider, perform: selectProvider)
-                    if !draft.preset.liveModels.isEmpty {
+                    if draft.preset.live != nil {
                         Picker(L("交互方式"), selection: $draft.mode) { Text(L("实时语音与视觉")).tag("live"); Text(L("文字与视觉")).tag("text") }
                     }
                     if !draft.isOffline {
                         KariModelField(title: draft.isLive ? L("实时模型") : L("文字 / 视觉模型"), model: draft.isLive ? $draft.liveModel : $draft.model, choices: draft.isLive ? draft.preset.liveModels : draft.preset.models)
+                    }
+                    if draft.isLive, let voices = draft.preset.live?.voices, let standard = voices.first {
+                        Picker(L("语音音色"), selection: $draft.voice) {
+                            Text(L("%@（默认）", standard)).tag(String?.none)
+                            ForEach(voices.dropFirst(), id: \.self) { Text($0).tag(Optional($0)) }
+                        }
                     }
                 }
                 if draft.provider == "vertex" {
@@ -40,7 +46,7 @@ struct KariSettingsView: View {
                         if draft.auth == "oauth" { Button(L("Google 授权"), action: authorize) }
                     }
                 }
-                if !["gemini", "vertex", "rule", "mock"].contains(draft.provider) {
+                if !["gemini", "vertex", "zhipu", "rule", "mock"].contains(draft.provider) {
                     Section(header: Text(L("服务地址"))) { input(L("HTTPS 或局域网服务地址"), text: $draft.baseUrl) }
                 }
                 if !draft.isOffline && draft.auth != "oauth" && draft.provider != "ollama" {

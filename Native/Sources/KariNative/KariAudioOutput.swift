@@ -24,6 +24,7 @@ final class KariAudioOutput {
     private var microphoneGeneration = 0
     private var voiceProcessingEnabled = false
     private var interrupted = false
+    private var configuringSession = false
     private var reconfiguring = false
     private var microphoneFrame: ((Data, Double) -> Void)?
     private var microphoneState: ((String, String) -> Void)?
@@ -48,6 +49,8 @@ final class KariAudioOutput {
             guard let self, let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
             if type == .began {
+                // Starting the engine can deliver this notification. The playback-only test never opens the microphone, so latching it fails every later chunk.
+                guard !self.configuringSession else { return }
                 self.interrupted = true
                 self.removeMicrophoneTap()
                 self.engine.pause()
@@ -70,10 +73,24 @@ final class KariAudioOutput {
     }
 
     func prepare() throws -> [String: Any] {
-        guard !interrupted else { throw failure("音频正被系统中断，请稍后恢复采集") }
         // Do not renegotiate AVAudioSession for every incoming speech chunk.
-        if !engine.isRunning { try activate?(); engine.prepare(); try engine.start() }
+        if !engine.isRunning { try startEngine() }
+        guard !interrupted else { throw failure("音频正被系统中断，请稍后恢复采集") }
         return status()
+    }
+
+    private func startEngine() throws {
+        configuringSession = true
+        interrupted = false
+        do {
+            try activate?()
+            engine.prepare()
+            try engine.start()
+        } catch {
+            configuringSession = false
+            throw error
+        }
+        DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
     }
 
     func startMicrophone(onFrame: @escaping (Data, Double) -> Void, onState: @escaping (String, String) -> Void) throws {
@@ -82,6 +99,7 @@ final class KariAudioOutput {
         interrupted = false
         removeMicrophoneTap()
         microphoneFrame = onFrame; microphoneState = onState; microphoneWanted = true
+        configuringSession = true
         do {
             try activate?()
             if !voiceProcessingEnabled {
@@ -124,8 +142,10 @@ final class KariAudioOutput {
             }
             microphoneTapInstalled = true
             if !engine.isRunning { engine.prepare(); try engine.start() }
+            DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
             onState("started", "")
         } catch {
+            configuringSession = false
             removeMicrophoneTap(); microphoneWanted = false
             throw error
         }
@@ -253,12 +273,17 @@ final class KariAudioOutput {
         playbackQueue.recover(); player.stop()
         reconfiguring = true
         defer { reconfiguring = false }
+        configuringSession = true
         do {
             try activate?()
             engine.stop(); engine.prepare(); try engine.start()
+            DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
             lastCompletion = ProcessInfo.processInfo.systemUptime
             pumpPlayback()
-        } catch { stop(message: "播放恢复失败：\(error.localizedDescription)") }
+        } catch {
+            configuringSession = false
+            stop(message: "播放恢复失败：\(error.localizedDescription)")
+        }
     }
 
     func test(completion: @escaping (Result<[String: Any], Error>) -> Void) throws {

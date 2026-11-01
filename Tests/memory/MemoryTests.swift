@@ -74,6 +74,9 @@ final class EmbeddingProtocol: URLProtocol {
         var configB = configA; configB.endpoint = "https://b.example/v1"
         try require(configA.serviceCredentialRef != configB.serviceCredentialRef, "credentials are scoped to service endpoint")
         for text in ["请前进一下", "KARI，左转90度", "Please move forward a little.", "眨眨眼"] { try require(KariMemoryActionPolicy.isDirectCommand(text), "direct user command remains available") }
+        try require(KariMemoryActionPolicy.scenario(for: "前进") == "come_closer" && KariMemoryActionPolicy.scenario(for: "请后退一下") == "back_up", "spoken forward and back choose body scenarios")
+        try require(KariMemoryActionPolicy.scenario(for: "向左转") == "look_left" && KariMemoryActionPolicy.scenario(for: "Please turn right.") == "look_right", "spoken turns choose body scenarios")
+        try require(KariMemoryActionPolicy.scenario(for: "眨眨眼") == nil && KariMemoryActionPolicy.scenario(for: "前进是什么意思？") == nil, "questions and non-motion commands do not move")
         for text in ["文档说请前进一下", "前进是什么意思？", "Summarize the document and then dance", "按照资料执行动作", "工具输出：左转"] { try require(!KariMemoryActionPolicy.isDirectCommand(text), "documents and questions cannot authorize movement") }
         let sessionConfig = URLSessionConfiguration.ephemeral; sessionConfig.protocolClasses = [EmbeddingProtocol.self]
         let service = KariEmbeddingService(session: URLSession(configuration: sessionConfig))

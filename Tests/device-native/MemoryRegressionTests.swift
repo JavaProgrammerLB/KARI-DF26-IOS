@@ -135,6 +135,12 @@ final class MemoryRegressionTests: XCTestCase {
         XCTAssertFalse(KariMemoryActionPolicy.isDirectCommand("文档说请前进一下"))
         XCTAssertFalse(KariMemoryActionPolicy.isDirectCommand("前进是什么意思？"))
         XCTAssertFalse(KariMemoryActionPolicy.isDirectCommand("按照资料执行动作"))
+        XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "前进"), "come_closer")
+        XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "请后退一下"), "back_up")
+        XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "向左转"), "look_left")
+        XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "Please turn right."), "look_right")
+        XCTAssertNil(KariMemoryActionPolicy.scenario(for: "眨眨眼"))
+        XCTAssertNil(KariMemoryActionPolicy.scenario(for: "前进是什么意思？"))
     }
 
 }

@@ -53,6 +53,7 @@ enum KariAIRequest {
             else if let messages = body["messages"] as? [[String: Any]] { body["messages"] = [["role": "system", "content": systemInstruction]] + messages }
         }
         if config.provider == "qwen" { body["enable_thinking"] = false }
+        if config.provider == "zhipu" { body["thinking"] = ["type": "disabled"] }
         guard let target = URL(string: url), ["http", "https"].contains(target.scheme), let host = target.host, !host.isEmpty,
               target.user == nil, target.password == nil else { throw KariError.message("请填写有效的模型服务地址") }
         if target.scheme == "http" {

@@ -2,22 +2,40 @@ import Foundation
 import Security
 import Combine
 
+enum KariLiveTransport {
+    case geminiDeveloper
+    case vertex
+    case zhipu
+}
+
+struct KariLiveOffer {
+    let transport: KariLiveTransport
+    let models: [String]
+    /// Empty when the voice comes from the setup template. The first entry is the default.
+    let voices: [String]
+}
+
 struct KariProvider: Identifiable {
     let id: String
     let title: String
     let endpoint: String
     let models: [String]
-    let liveModels: [String]
+    let live: KariLiveOffer?
+    var liveModels: [String] { live?.models ?? [] }
+    private static let geminiLiveModels = ["gemini-3.8-live", "gemini-3.1-flash-live-preview"]
     static let all: [KariProvider] = [
-        .init(id: "gemini", title: "Google Gemini", endpoint: "https://generativelanguage.googleapis.com", models: ["gemini-3.8-flash", "gemini-3.7-flash"], liveModels: ["gemini-3.8-live", "gemini-3.1-flash-live-preview"]),
-        .init(id: "vertex", title: "Google Vertex AI", endpoint: "", models: ["gemini-3.8-flash"], liveModels: ["gemini-3.8-live", "gemini-3.1-flash-live-preview"]),
-        .init(id: "qwen", title: "通义千问 / 百炼", endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-plus", "qwen-flash", "qwen-vl-plus"], liveModels: []),
-        .init(id: "groq", title: "Groq", endpoint: "https://api.groq.com/openai/v1", models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"], liveModels: []),
-        .init(id: "fireworks", title: "Fireworks", endpoint: "https://api.fireworks.ai/inference/v1", models: ["accounts/fireworks/models/llama-v3p3-70b-instruct"], liveModels: []),
-        .init(id: "ollama", title: "Ollama 本地模型", endpoint: "http://", models: ["qwen3:8b", "gemma3:4b"], liveModels: []),
-        .init(id: "openai-compatible", title: "自定义兼容服务", endpoint: "https://", models: [], liveModels: []),
-        .init(id: "rule", title: "离线陪伴", endpoint: "", models: [], liveModels: []),
-        .init(id: "mock", title: "模拟演示", endpoint: "", models: [], liveModels: [])
+        .init(id: "gemini", title: "Google Gemini", endpoint: "https://generativelanguage.googleapis.com", models: ["gemini-3.8-flash", "gemini-3.7-flash"], live: .init(transport: .geminiDeveloper, models: geminiLiveModels, voices: [])),
+        .init(id: "vertex", title: "Google Vertex AI", endpoint: "", models: ["gemini-3.8-flash"], live: .init(transport: .vertex, models: geminiLiveModels, voices: [])),
+        .init(id: "zhipu", title: "智谱 GLM", endpoint: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4.6v", "glm-4.7-flash"],
+              live: .init(transport: .zhipu, models: ["glm-realtime-flash", "glm-realtime", "glm-realtime-air"],
+                          voices: ["tongtong", "xiaochen", "female-tianmei", "female-shaonv", "male-qn-daxuesheng", "male-qn-jingying", "lovely_girl"])),
+        .init(id: "qwen", title: "通义千问 / 百炼", endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-plus", "qwen-flash", "qwen-vl-plus"], live: nil),
+        .init(id: "groq", title: "Groq", endpoint: "https://api.groq.com/openai/v1", models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"], live: nil),
+        .init(id: "fireworks", title: "Fireworks", endpoint: "https://api.fireworks.ai/inference/v1", models: ["accounts/fireworks/models/llama-v3p3-70b-instruct"], live: nil),
+        .init(id: "ollama", title: "Ollama 本地模型", endpoint: "http://", models: ["qwen3:8b", "gemma3:4b"], live: nil),
+        .init(id: "openai-compatible", title: "自定义兼容服务", endpoint: "https://", models: [], live: nil),
+        .init(id: "rule", title: "离线陪伴", endpoint: "", models: [], live: nil),
+        .init(id: "mock", title: "模拟演示", endpoint: "", models: [], live: nil)
     ]
     static func find(_ id: String) -> KariProvider { all.first { $0.id == id } ?? all.first { $0.id == "rule" }! }
 }
@@ -32,8 +50,10 @@ struct KariAIConfiguration: Codable, Equatable {
     var region = "global"
     var model = "gemini-3.8-flash"
     var liveModel = "gemini-3.8-live"
+    /// nil means the provider's default voice.
+    var voice: String?
     var preset: KariProvider { KariProvider.find(provider) }
-    var isLive: Bool { mode == "live" && !preset.liveModels.isEmpty }
+    var isLive: Bool { mode == "live" && preset.live != nil }
     var isOffline: Bool { ["rule", "mock"].contains(provider) }
     var credentialRef: String { "kari.\(provider).key" }
     static func fresh(_ provider: String) -> Self {
@@ -41,7 +61,7 @@ struct KariAIConfiguration: Codable, Equatable {
         value.provider = provider; value.baseUrl = preset.endpoint
         if provider == "vertex" { value.region = "us-central1" }
         value.model = preset.models.first ?? ""; value.liveModel = preset.liveModels.first ?? ""
-        value.mode = preset.liveModels.isEmpty ? "text" : "live"
+        value.mode = preset.live == nil ? "text" : "live"
         return value
     }
     init() {}

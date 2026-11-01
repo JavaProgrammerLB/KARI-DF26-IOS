@@ -140,7 +140,7 @@ struct KariWakeSettingsView: View {
                     .disabled(!app.settings.configuration.isLive)
                 Picker(L("唤醒短语"), selection: $features.wakeSettings.preset) { ForEach(WakePreset.allCases, id: \.self) { Text($0.title).tag($0) } }
                 Stepper(value: $features.wakeSettings.silenceTimeout, in: 30...300, step: 10) { Text(L("对话静默超时秒数") + ": \(Int(features.wakeSettings.silenceTimeout))") }
-                Text(L("仅 Gemini／标准 Vertex 实时语音支持唤醒模式；文字模式保持原有方式。")).font(.footnote)
+                Text(L("仅 Gemini／标准 Vertex／智谱实时语音支持唤醒模式；文字模式保持原有方式。")).font(.footnote)
                 Text(L("唤醒后连续对话；静默超时返回等待，不自动恢复身体动作。")).font(.footnote)
             }
             Section(header: Text(L("本地识别"))) {

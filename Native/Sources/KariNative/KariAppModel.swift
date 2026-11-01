@@ -372,6 +372,7 @@ import Combine
     @discardableResult func sendText(_ text: String, includeImage: Bool = false) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         if KariAIRequest.isStopRequest(text) { companion.interact(); stopBodyImmediately(); return true }
+        if let name = KariMemoryActionPolicy.scenario(for: text), phase == .active { Task { try? await runScenario(name) } }
         if companion.wakeSettings.enabled && settings.configuration.isLive && !wake.mayUpload { notice = "请先唤醒，再发送消息"; return false }
         companion.interact()
         if live.connected { live.sendText(text); return true }

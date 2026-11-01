@@ -149,6 +149,62 @@ check(testGeneration["maxOutputTokens"] as? Int == 256 && testGeneration["respon
 check((testLive["tools"] as? [Any])?.isEmpty == true && (testLive["sessionResumption"] as? [String: Any])?.isEmpty == true, "AI test isolates tools and previous conversation")
 let regularLive = KariLiveConfiguration.setup(originalLive, model: "models/regular", testOnly: false)
 check((regularLive["generationConfig"] as? [String: Any])?["maxOutputTokens"] == nil && (regularLive["tools"] as? [Any])?.count == 1, "normal companion retains original configuration")
+let preVoiceProfile = Data(#"{"provider":"gemini","mode":"live","auth":"apiKey","endpointType":"standard","baseUrl":"https://generativelanguage.googleapis.com","projectId":"","region":"global","model":"gemini-3.8-flash","liveModel":"gemini-3.8-live"}"#.utf8)
+check(try JSONDecoder().decode(KariAIConfiguration.self, from: preVoiceProfile).voice == nil, "profiles saved before voice selection still decode")
+func canonicalJSON(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) }
+let liveTemplate: [String: Any] = ["model": "placeholder", "generationConfig": ["responseModalities": ["AUDIO"]], "systemInstruction": ["parts": [["text": "companion"]]],
+                                   "tools": [["functionDeclarations": [["name": "run_scenario", "description": "Run a scenario.", "parameters": ["type": "OBJECT", "properties": ["name": ["type": "STRING"], "reason": ["type": "STRING", "nullable": true]], "required": ["name"]]]]]]]
+let liveContext = KariLiveSessionContext(personality: "warm persona", memoryInstruction: "MEMORY POLICY", resumeHandle: "resume-1")
+var goldenSetup = KariLiveConfiguration.setup(liveTemplate, model: "models/gemini-3.8-live", testOnly: false)
+var goldenParts = (goldenSetup["systemInstruction"] as! [String: Any])["parts"] as! [[String: Any]]
+goldenParts.append(["text": "warm persona"])
+goldenParts.append(["text": "MEMORY POLICY Use search_memory with a self-contained query before answering document or personal-memory questions. State only references returned by that tool. Never read UUID citation IDs aloud; mention document names and locations instead."])
+goldenSetup["tools"] = (goldenSetup["tools"] as! [[String: Any]]) + [["functionDeclarations": [["name": "search_memory", "description": "Search the user's imported memory documents; no physical actions.", "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "A self-contained search question"]], "required": ["query"]]]]]]
+goldenSetup["systemInstruction"] = ["parts": goldenParts]
+goldenSetup["sessionResumption"] = ["handle": "resume-1"]
+let geminiWire = try KariAIConfiguration.fresh("gemini").liveWire()
+check(try canonicalJSON(geminiWire.setupMessage(template: liveTemplate, context: liveContext)) == canonicalJSON(["setup": goldenSetup]), "Gemini Live setup message is unchanged")
+let geminiConnect = geminiWire.connectRequest(credential: "gemini-key")
+check(geminiConnect.url?.host == "generativelanguage.googleapis.com" && geminiConnect.value(forHTTPHeaderField: "x-goog-api-key") == "gemini-key", "Gemini Live dials Google with the API key header")
+check(try canonicalJSON(geminiWire.encode(.audio(Data([1, 2])))) == canonicalJSON([["realtimeInput": ["audio": ["data": "AQI=", "mimeType": "audio/pcm;rate=16000"]]]]), "Gemini Live audio frame is unchanged")
+var vertexLive = KariAIConfiguration.fresh("vertex"); vertexLive.projectId = "test-project"
+check(try vertexLive.liveWire().connectRequest(credential: "k").url?.host == "us-central1-aiplatform.googleapis.com", "Vertex Live keeps its regional host")
+let zhipuLive = KariAIConfiguration.fresh("zhipu")
+check(zhipuLive.isLive && zhipuLive.voice == nil, "fresh Zhipu profile is Live with the provider voice")
+let zhipuConnect = try zhipuLive.liveWire().connectRequest(credential: "zhipu-key")
+check(zhipuConnect.url?.host == "open.bigmodel.cn" && zhipuConnect.value(forHTTPHeaderField: "Authorization") == "Bearer zhipu-key" && zhipuConnect.value(forHTTPHeaderField: "x-goog-api-key") == nil, "Zhipu Live dials open.bigmodel.cn with a bearer header")
+let zhipuSetup = try zhipuLive.liveWire().setupMessage(template: liveTemplate, context: liveContext)
+let zhipuSession = zhipuSetup["session"] as! [String: Any]
+let zhipuSetupText = String(data: try canonicalJSON(zhipuSetup), encoding: .utf8)!
+check(zhipuSetup["type"] as? String == "session.update" && zhipuSession["input_audio_format"] as? String == "pcm" && zhipuSession["output_audio_format"] as? String == "pcm", "Zhipu session uses PCM audio")
+check((zhipuSession["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "video_passive" && zhipuSession["voice"] as? String == "tongtong", "Zhipu session accepts camera frames with the default voice")
+check(!zhipuSetupText.contains("googleapis.com") && !zhipuSetupText.contains("models/"), "Zhipu session never carries a Google host or model path")
+check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["tools"] as? [[String: Any]])?.map { $0["name"] as? String } == ["run_scenario", "search_memory"], "Zhipu shares the Gemini prompt and tools")
+check(!zhipuSetupText.contains("OBJECT") && !zhipuSetupText.contains("nullable"), "Zhipu tool parameters are JSON Schema")
+let zhipuTest = try zhipuLive.liveWire(testOnly: true)
+check(((zhipuTest.setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any])["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "audio" && zhipuTest.encode(.video(Data([1]))).isEmpty, "Zhipu AI test stays on audio and omits video")
+var zhipuVoice = zhipuLive; zhipuVoice.voice = "xiaochen"
+check((try zhipuVoice.liveWire().setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any])["voice"] as? String == "xiaochen", "chosen Zhipu voice is sent")
+zhipuVoice.voice = "retired-voice"
+check((try zhipuVoice.liveWire().setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any])["voice"] as? String == "tongtong", "unknown Zhipu voice falls back to the default")
+var zhipuPath = zhipuLive; zhipuPath.liveModel = "models/glm-realtime"
+rejects("Zhipu model id cannot carry a path") { _ = try zhipuPath.liveWire() }
+let zhipuWire = try zhipuLive.liveWire()
+func zhipuEvents(_ json: String) throws -> [KariLiveEvent] { try zhipuWire.decode(JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]) }
+let zhipuAudio = try zhipuEvents(#"{"type":"response.audio.delta","delta":"AQIDBA=="}"#)
+if case .audio(let pcm)? = zhipuAudio.first { check(pcm == Data([1, 2, 3, 4]), "Zhipu audio delta decodes to PCM") } else { check(false, "Zhipu audio delta decodes to PCM") }
+if case .interrupted? = try zhipuEvents(#"{"type":"input_audio_buffer.speech_started"}"#).first { passed += 1 } else { check(false, "Zhipu speech start interrupts playback") }
+if case .ready? = try zhipuEvents(#"{"type":"session.updated"}"#).first { passed += 1 } else { check(false, "Zhipu session.updated is ready") }
+check(try zhipuEvents(#"{"type":"session.created"}"#).isEmpty, "Zhipu session.created is ignored")
+if case .toolCalls(let calls)? = try zhipuEvents(#"{"type":"response.function_call_arguments.done","name":"run_scenario","arguments":"{\"name\":\"wave\"}"}"#).first {
+    check(calls.first?.id == "" && calls.first?.arguments?["name"] as? String == "wave", "Zhipu tool call without call id still parses")
+    let item = zhipuWire.encode(.toolResults([.init(id: "", name: "run_scenario", response: ["ok": true])])).first?["item"] as? [String: Any]
+    check(item?["call_id"] == nil && item?["object"] as? String == "realtime.item", "Zhipu tool result matches the documented item")
+} else { check(false, "Zhipu tool call without call id still parses") }
+rejects("Zhipu error frame fails the session") { _ = try zhipuEvents(#"{"type":"error","error":{"message":"denied"}}"#) }
+let zhipuText = try KariAIRequest.text(zhipuLive, key: "zhipu-key", prompt: "hello")
+let zhipuTextBody = try JSONSerialization.jsonObject(with: zhipuText.httpBody!) as! [String: Any]
+check(zhipuText.url?.absoluteString == "https://open.bigmodel.cn/api/paas/v4/chat/completions" && zhipuTextBody["thinking"] as? [String: String] == ["type": "disabled"], "Zhipu text request disables thinking")
 check(KariLocalization.resolve(.system, preferred: ["zh-Hant-TW", "en-US"]) == "zh-Hans", "Chinese system locale resolves to Chinese")
 check(KariLocalization.resolve(.system, preferred: ["en-GB", "zh-Hans"]) == "en", "English system locale resolves to English")
 check(KariLocalization.resolve(.system, preferred: ["fr-FR"]) == "en", "unsupported interface language falls back to English")

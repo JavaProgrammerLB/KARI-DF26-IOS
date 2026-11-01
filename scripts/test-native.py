@@ -8,7 +8,7 @@ import plistlib
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-sources = ['KariDeviceReadiness', 'KariFirmwareCache', 'KariSettings', 'KariBodyProtocol', 'KariAIRequest', 'KariPlaybackQueue', 'KariLiveConfiguration', 'KariLocalization', 'KariConversationLanguage']
+sources = ['KariDeviceReadiness', 'KariFirmwareCache', 'KariSettings', 'KariBodyProtocol', 'KariAIRequest', 'KariPlaybackQueue', 'KariLiveConfiguration', 'KariLiveWire', 'KariLocalization', 'KariConversationLanguage']
 with tempfile.TemporaryDirectory(prefix='kari-native-tests-') as folder:
     output = Path(folder) / 'native-checks'
     subprocess.run(['xcrun', 'swiftc', '-module-cache-path', str(Path(folder) / 'cache'),
