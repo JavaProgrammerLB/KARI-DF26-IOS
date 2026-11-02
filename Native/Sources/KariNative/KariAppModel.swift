@@ -7,6 +7,10 @@ import Combine
     @Published var notice = "就在这里，陪着你"
     @Published var textReply = ""
     @Published var cameraEnabled = true
+    /// Set only when the user turns Zhipu live video on. Each new companion session starts voice-only.
+    private var zhipuCameraOptIn = false
+    private var appliedCameraKey = ""
+    var zhipuVoice: Bool { settings.configuration.provider == "zhipu" && settings.configuration.isLive }
     @Published private(set) var recovering = false
     @Published private(set) var liveConnectionFailure = ""
     private let liveStarter: ((KariAIConfiguration) async throws -> Void)?
@@ -58,7 +62,9 @@ import Combine
             Task { @MainActor in guard let self else { return }; self.memory.resume(self.settings.configuration) }
         }.store(in: &subscriptions)
         memory.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &subscriptions)
-        settings.$configuration.dropFirst().sink { [weak self] _ in self?.memory.invalidateQuery(); self?.live.clearResumption() }.store(in: &subscriptions)
+        settings.$configuration.dropFirst().sink { [weak self] config in
+            self?.memory.invalidateQuery(); self?.live.clearResumption(); self?.applyIdleCameraDefault(config)
+        }.store(in: &subscriptions)
         live.memoryAvailable = { [weak self] in self?.memory.hasEnabledDocuments == true }
         live.onMemorySearch = { [weak self] query in
             guard let self else { throw CancellationError() }
@@ -66,6 +72,7 @@ import Combine
         }
         live.onMemoryCancel = { [weak self] in self?.memory.invalidateQuery() }
         if testing { try? settings.save(.fresh("rule"), key: "") }
+        applyIdleCameraDefault(settings.configuration)
         companion.attach(self); wake.app = self
         wake.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &subscriptions)
         live.$speaking.removeDuplicates().sink { [weak self] value in self?.companion.lifeEvent(value ? "playback_started" : "playback_stopped") }.store(in: &subscriptions)
@@ -128,6 +135,12 @@ import Combine
         liveConnectionFailure = ""; notice = "正在开始陪伴…"
         operation = Task {
             let config = settings.configuration
+            let uploadVideo = !(config.provider == "zhipu" && config.isLive) || zhipuCameraOptIn
+            live.setUploadsVideo(uploadVideo)
+            if config.provider == "zhipu" && config.isLive && !uploadVideo && !companion.vision.enabled {
+                cameraEnabled = false
+                if camera.running { camera.stop() }
+            }
             if config.isLive && !companion.wakeSettings.enabled {
                 do { try await connectLive(config) }
                 catch {
@@ -141,14 +154,17 @@ import Combine
                 do { if !camera.running { try await camera.start(front: camera.front) } }
                 catch {
                     guard current == token, !Task.isCancelled else { return }
-                    cameraEnabled = false; cameraNotice = "摄像头未开启，语音仍可继续。\(error.localizedDescription)"
+                    cameraEnabled = false
+                    if config.provider == "zhipu" && config.isLive { zhipuCameraOptIn = false; live.setUploadsVideo(false) }
+                    cameraNotice = "摄像头未开启，语音仍可继续。\(error.localizedDescription)"
                 }
             }
             guard current == token, !Task.isCancelled else { return }
             settings.motionEnabled = !(config.isLive && companion.wakeSettings.enabled)
             phase = .active
             let failures = [liveConnectionFailure, cameraNotice].filter { !$0.isEmpty }
-            notice = failures.isEmpty ? (config.isLive ? "可以直接说话，我在听。" : "陪伴已开始，可使用下方文字交流。") : failures.joined(separator: "\n")
+            let listening = config.provider == "zhipu" && config.isLive && !live.uploadsVideo ? "可以直接说话，我在听。实时画面默认关闭，需要时再点开启实时画面。" : "可以直接说话，我在听。"
+            notice = failures.isEmpty ? (config.isLive ? listening : "陪伴已开始，可使用下方文字交流。") : failures.joined(separator: "\n")
             UIApplication.shared.isIdleTimerDisabled = true
             if config.isLive && companion.wakeSettings.enabled { companion.invalidateFollow("等待唤醒期间不跟随，请手动开启运动") }
             companion.begin()
@@ -167,6 +183,11 @@ import Combine
         UIApplication.shared.isIdleTimerDisabled = false
         body.stopScan(); let stopped = await motion.stop()
         phase = .idle; notice = stopped ? "陪伴已结束，麦克风和摄像头已关闭。" : "采集已关闭；身体停止未获确认，请检查机器人。"
+        if settings.configuration.provider == "zhipu" && settings.configuration.isLive {
+            zhipuCameraOptIn = false
+            live.setUploadsVideo(false)
+            if !companion.vision.enabled { cameraEnabled = false }
+        }
     }
     func recoverCapture() {
         guard phase == .active, !recovering else { return }
@@ -201,15 +222,64 @@ import Combine
             UIApplication.shared.isIdleTimerDisabled = false
         } else { await stop() }
     }
-    func toggleCameraIfNeeded() { if !camera.running { cameraEnabled = false; toggleCamera() } }
+    func toggleCameraIfNeeded() {
+        guard !camera.running else { return }
+        cameraEnabled = true
+        operation = Task {
+            do { try await camera.start(front: camera.front) }
+            catch { cameraEnabled = false; notice = error.localizedDescription }
+        }
+    }
     func toggleCamera() {
+        if zhipuVoice && !live.uploadsVideo {
+            cameraEnabled = true
+            operation = Task {
+                do {
+                    if !camera.running { try await camera.start(front: camera.front) }
+                    zhipuCameraOptIn = true
+                    live.setUploadsVideo(true)
+                } catch {
+                    cameraEnabled = false
+                    zhipuCameraOptIn = false
+                    live.setUploadsVideo(false)
+                    notice = error.localizedDescription
+                }
+            }
+            return
+        }
         cameraEnabled.toggle()
-        if !cameraEnabled { companion.cameraChanged(); camera.stop(); return }
-        operation = Task { do { try await camera.start(front: camera.front) } catch { cameraEnabled = false; notice = error.localizedDescription } }
+        if !cameraEnabled {
+            if zhipuVoice { zhipuCameraOptIn = false; live.setUploadsVideo(false) }
+            companion.cameraChanged(); camera.stop(); return
+        }
+        operation = Task {
+            do { try await camera.start(front: camera.front); if zhipuVoice { zhipuCameraOptIn = true; live.setUploadsVideo(true) } }
+            catch { cameraEnabled = false; if zhipuVoice { zhipuCameraOptIn = false; live.setUploadsVideo(false) }; notice = error.localizedDescription }
+        }
     }
     func switchCamera() {
         companion.cameraChanged()
-        operation = Task { do { try await camera.start(front: !camera.front); cameraEnabled = true } catch { notice = error.localizedDescription } }
+        operation = Task {
+            do {
+                try await camera.start(front: !camera.front)
+                cameraEnabled = true
+                if zhipuVoice { zhipuCameraOptIn = true; live.setUploadsVideo(true) }
+            } catch { notice = error.localizedDescription }
+        }
+    }
+    private func applyIdleCameraDefault(_ config: KariAIConfiguration) {
+        guard phase == .idle else { return }
+        let key = "\(config.provider).\(config.isLive)"
+        guard key != appliedCameraKey else { return }
+        appliedCameraKey = key
+        zhipuCameraOptIn = false
+        if config.provider == "zhipu" && config.isLive {
+            live.setUploadsVideo(false)
+            if !companion.vision.enabled { cameraEnabled = false; if camera.running { camera.stop() } }
+        } else {
+            live.setUploadsVideo(true)
+            cameraEnabled = true
+        }
     }
     func testSound() {
         let current = token

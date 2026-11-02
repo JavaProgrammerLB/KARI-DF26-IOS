@@ -25,7 +25,7 @@ struct KariSettingsView: View {
                         ForEach(KariProvider.all) { provider in Text(L(provider.title)).tag(provider.id) }
                     }.onChange(of: draft.provider, perform: selectProvider)
                     if draft.preset.live != nil {
-                        Picker(L("交互方式"), selection: $draft.mode) { Text(L("实时语音与视觉")).tag("live"); Text(L("文字与视觉")).tag("text") }
+                        Picker(L("交互方式"), selection: $draft.mode) { Text(L(draft.provider == "zhipu" ? "实时语音" : "实时语音与视觉")).tag("live"); Text(L("文字与视觉")).tag("text") }
                     }
                     if !draft.isOffline {
                         KariModelField(title: draft.isLive ? L("实时模型") : L("文字 / 视觉模型"), model: draft.isLive ? $draft.liveModel : $draft.model, choices: draft.isLive ? draft.preset.liveModels : draft.preset.models)
