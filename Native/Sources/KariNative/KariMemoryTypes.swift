@@ -146,17 +146,25 @@ enum KariMemoryActionPolicy {
     static func isDirectCommand(_ text: String) -> Bool {
         guard text.count <= 240 else { return false }
         let value = text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
-        let chinese = "^(?:你好卡里|嘿卡里|kari|卡里)?(?:请你|请|帮我|给我|麻烦你)?(?:向前走|向后走|前进|后退|向左转|向右转|左转|右转|转一圈|转圈|跳舞|动一动|做个动作|打个招呼|眨眨眼|眨眼|笑一下|开心一点)(?:一下|一点|一会儿|两步|一次|一圈|[0-9一二三四五六七八九十]+(?:秒|度|步))?(?:吧|好吗|可以吗)?$"
+        let chinese = "^(?:你好卡里|嘿卡里|kari|卡里)?(?:请你|请|帮我|给我|麻烦你)?(?:往前走|往后走|往后退|向后退|向前走|向后走|往左转|往右转|向左转|向右转|前进|后退|往前|往后|向前|向后|往左|往右|向左|向右|左转|右转|转一圈|转圈|跳舞|动一动|做个动作|打个招呼|眨眨眼|眨眼|笑一下|开心一点)(?:一下|一点|一会儿|两步|一次|一圈|[0-9一二三四五六七八九十]+(?:秒|度|步))?(?:吧|好吗|可以吗)?$"
         let english = "^(?:heykari|kari)?(?:please)?(?:moveforward|goforward|movebackward|gobackward|turnleft|turnright|spin|dance|wave|blink|smile)(?:abit|alittle|once|for[0-9]+seconds?)?(?:please)?$"
         return value.range(of: chinese, options: .regularExpression) != nil || value.range(of: english, options: .regularExpression) != nil
     }
     static func scenario(for text: String) -> String? {
         guard isDirectCommand(text) else { return nil }
         let value = text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
-        let commands = [("向后走", "back_up"), ("后退", "back_up"), ("movebackward", "back_up"), ("gobackward", "back_up"),
-                        ("向前走", "come_closer"), ("前进", "come_closer"), ("moveforward", "come_closer"), ("goforward", "come_closer"),
-                        ("向左转", "look_left"), ("左转", "look_left"), ("turnleft", "look_left"),
-                        ("向右转", "look_right"), ("右转", "look_right"), ("turnright", "look_right")]
+        let commands = [("往后走", "back_up"), ("往后退", "back_up"), ("向后走", "back_up"), ("向后退", "back_up"), ("往后", "back_up"), ("向后", "back_up"), ("后退", "back_up"), ("movebackward", "back_up"), ("gobackward", "back_up"),
+                        ("往前走", "come_closer"), ("向前走", "come_closer"), ("往前", "come_closer"), ("向前", "come_closer"), ("前进", "come_closer"), ("moveforward", "come_closer"), ("goforward", "come_closer"),
+                        ("往左转", "look_left"), ("向左转", "look_left"), ("往左", "look_left"), ("向左", "look_left"), ("左转", "look_left"), ("turnleft", "look_left"),
+                        ("往右转", "look_right"), ("向右转", "look_right"), ("往右", "look_right"), ("向右", "look_right"), ("右转", "look_right"), ("turnright", "look_right")]
         return commands.first { value.contains($0.0) }?.1
+    }
+    /// Maps a tool argument to a face scenario. Chinese motion phrases use the direct-command check; other scenario ids pass through unchanged.
+    static func resolveToolScenario(_ raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let motion = scenario(for: value) { return motion }
+        let normalized = value.lowercased().filter { $0.isLetter || $0.isNumber || $0 == "_" }
+        guard normalized.range(of: "^[a-z][a-z0-9_]{0,48}$", options: .regularExpression) != nil else { return nil }
+        return normalized
     }
 }

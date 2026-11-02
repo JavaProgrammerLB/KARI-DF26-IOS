@@ -2,6 +2,7 @@
 "提供商" = "Provider";
 "交互方式" = "Interaction mode";
 "实时语音与视觉" = "Live voice and vision";
+"实时语音" = "Live voice";
 "文字与视觉" = "Text and vision";
 "实时模型" = "Live model";
 "文字 / 视觉模型" = "Text / vision model";
@@ -148,6 +149,8 @@
 "正在开始陪伴…" = "Starting companionship…";
 "摄像头未开启，语音仍可继续。%@" = "Camera unavailable; voice can continue. %@";
 "可以直接说话，我在听。" = "You can speak now. I’m listening.";
+"可以直接说话，我在听。实时画面默认关闭，需要时再点开启实时画面。" = "You can speak now. I’m listening. Live video stays off until you turn it on.";
+"开启实时画面" = "Turn on live video";
 "陪伴已开始，可使用下方文字交流。" = "Companionship started. Use the text field to chat.";
 "陪伴已结束，麦克风和摄像头已关闭。" = "Companionship ended. Microphone and camera are off.";
 "采集已关闭；身体停止未获确认，请检查机器人。" = "Capture is off, but the robot did not confirm stopping. Check your robot.";

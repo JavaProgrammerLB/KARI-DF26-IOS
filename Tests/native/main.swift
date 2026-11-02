@@ -173,10 +173,25 @@ let zhipuSetup = try zhipuLive.liveWire().setupMessage(template: liveTemplate, c
 let zhipuSession = zhipuSetup["session"] as! [String: Any]
 let zhipuSetupText = String(data: try canonicalJSON(zhipuSetup), encoding: .utf8)!
 check(zhipuSetup["type"] as? String == "session.update" && zhipuSession["input_audio_format"] as? String == "pcm" && zhipuSession["output_audio_format"] as? String == "pcm", "Zhipu session uses PCM audio")
-check((zhipuSession["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "video_passive" && zhipuSession["voice"] as? String == "tongtong", "Zhipu session accepts camera frames with the default voice")
+let zhipuBeta = zhipuSession["beta_fields"] as? [String: Any]
+check(zhipuBeta?["chat_mode"] as? String == "audio" && zhipuBeta?["auto_search"] as? Bool == false && zhipuSession["voice"] as? String == "tongtong", "Zhipu session defaults to voice-only and disables web search")
+check((zhipuSession["temperature"] as? Double) == 0.2 && (zhipuSession["turn_detection"] as? [String: Any])?["silence_duration_ms"] as? Int == 700, "Zhipu keeps a low temperature and Gemini's end-of-speech pause")
 check(!zhipuSetupText.contains("googleapis.com") && !zhipuSetupText.contains("models/"), "Zhipu session never carries a Google host or model path")
-check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["tools"] as? [[String: Any]])?.map { $0["name"] as? String } == ["run_scenario", "search_memory"], "Zhipu shares the Gemini prompt and tools")
+let zhipuTools = (zhipuSession["tools"] as? [[String: Any]])?.map { $0["name"] as? String }
+check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["instructions"] as? String)?.contains("前进") == true && zhipuTools == ["drive", "run_scenario", "search_memory"], "Zhipu keeps the Gemini prompt and adds the car drive tool")
 check(!zhipuSetupText.contains("OBJECT") && !zhipuSetupText.contains("nullable"), "Zhipu tool parameters are JSON Schema")
+let zhipuDefaultWire = try zhipuLive.liveWire()
+check(zhipuDefaultWire.encode(.video(Data([1]))).isEmpty, "default Zhipu session does not upload camera frames")
+let zhipuVideo = try zhipuLive.liveWire(acceptsVideo: true)
+let zhipuVideoSession = try zhipuVideo.setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any]
+check((zhipuVideoSession["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "video_passive" && zhipuVideo.encode(.video(Data([9]))).count == 1, "explicit camera opt-in accepts one video frame")
+let zhipuVoiceAgain = zhipuVideo.updateVideo(false).first?["session"] as? [String: Any]
+check((zhipuVoiceAgain?["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "audio" && zhipuVideo.encode(.video(Data([9]))).isEmpty, "turning the camera off returns to voice-only and drops frames")
+let visualTemplate: [String: Any] = ["model": "placeholder", "systemInstruction": ["parts": [["text": "before <perception_truth>Use live camera frames for visual questions.</perception_truth> after <body_context_rules>Do not call tools because of body_context.</body_context_rules> tail"]]], "tools": []]
+let audioVisual = (try zhipuLive.liveWire().setupMessage(template: visualTemplate, context: .init())["session"] as! [String: Any])["instructions"] as! String
+check(!audioVisual.contains("Use live camera frames") && !audioVisual.contains("body_context") && audioVisual.contains("before") && audioVisual.contains("tail") && audioVisual.contains("The camera is off"), "voice-only Zhipu drops camera instructions")
+let videoVisual = (try zhipuLive.liveWire(acceptsVideo: true).setupMessage(template: visualTemplate, context: .init())["session"] as! [String: Any])["instructions"] as! String
+check(videoVisual.contains("Use live camera frames") && videoVisual.contains("body_context") && videoVisual.contains("The camera is on"), "camera opt-in keeps visual instructions")
 let zhipuTest = try zhipuLive.liveWire(testOnly: true)
 check(((zhipuTest.setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any])["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "audio" && zhipuTest.encode(.video(Data([1]))).isEmpty, "Zhipu AI test stays on audio and omits video")
 var zhipuVoice = zhipuLive; zhipuVoice.voice = "xiaochen"
@@ -192,6 +207,14 @@ if case .audio(let pcm)? = zhipuAudio.first { check(pcm == Data([1, 2, 3, 4]), "
 if case .interrupted? = try zhipuEvents(#"{"type":"input_audio_buffer.speech_started"}"#).first { passed += 1 } else { check(false, "Zhipu speech start interrupts playback") }
 if case .ready? = try zhipuEvents(#"{"type":"session.updated"}"#).first { passed += 1 } else { check(false, "Zhipu session.updated is ready") }
 check(try zhipuEvents(#"{"type":"session.created"}"#).isEmpty, "Zhipu session.created is ignored")
+if case .toolCalls(let drive)? = try zhipuEvents(#"{"type":"response.function_call_arguments.done","name":"drive","arguments":{"direction":"前进"}}"#).first {
+    check(drive.first?.name == "drive" && drive.first?.arguments?["direction"] as? String == "前进", "Zhipu drive arguments may already be an object")
+} else { check(false, "Zhipu drive arguments may already be an object") }
+if case .heard(let heardCommand)? = try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"user","content":[{"transcript":"前进"}]}}"#).first {
+    check(heardCommand == "前进", "Zhipu item transcript is a heard command")
+} else { check(false, "Zhipu item transcript is a heard command") }
+check(try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"assistant","content":[{"transcript":"前进"}]}}"#).isEmpty, "assistant transcript is not a car command")
+check(try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"user","content":[{"transcript":null}]}}"#).isEmpty, "null Zhipu transcript is ignored")
 if case .toolCalls(let calls)? = try zhipuEvents(#"{"type":"response.function_call_arguments.done","name":"run_scenario","arguments":"{\"name\":\"wave\"}"}"#).first {
     check(calls.first?.id == "" && calls.first?.arguments?["name"] as? String == "wave", "Zhipu tool call without call id still parses")
     let item = zhipuWire.encode(.toolResults([.init(id: "", name: "run_scenario", response: ["ok": true])])).first?["item"] as? [String: Any]
