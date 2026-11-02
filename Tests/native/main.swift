@@ -172,19 +172,23 @@ check(zhipuConnect.url?.host == "open.bigmodel.cn" && zhipuConnect.value(forHTTP
 let zhipuSetup = try zhipuLive.liveWire().setupMessage(template: liveTemplate, context: liveContext)
 let zhipuSession = zhipuSetup["session"] as! [String: Any]
 let zhipuSetupText = String(data: try canonicalJSON(zhipuSetup), encoding: .utf8)!
-check(zhipuSetup["type"] as? String == "session.update" && zhipuSession["input_audio_format"] as? String == "pcm" && zhipuSession["output_audio_format"] as? String == "pcm", "Zhipu session uses PCM audio")
+check(zhipuSetup["type"] as? String == "session.update" && zhipuSession["input_audio_format"] as? String == "pcm" && zhipuSession["output_audio_format"] as? String == "pcm", "Zhipu voice-only session uploads the same PCM the camera uses")
 let zhipuBeta = zhipuSession["beta_fields"] as? [String: Any]
 check(zhipuBeta?["chat_mode"] as? String == "audio" && zhipuBeta?["auto_search"] as? Bool == false && zhipuSession["voice"] as? String == "tongtong", "Zhipu session defaults to voice-only and disables web search")
-check((zhipuSession["temperature"] as? Double) == 0.2 && (zhipuSession["turn_detection"] as? [String: Any])?["silence_duration_ms"] as? Int == 700, "Zhipu keeps a low temperature and Gemini's end-of-speech pause")
+check((zhipuSession["temperature"] as? Double) == 0.2 && (zhipuSession["turn_detection"] as? [String: Any])?["silence_duration_ms"] as? Int == 700 && (zhipuSession["turn_detection"] as? [String: Any])?["threshold"] as? Double == 0.15, "Zhipu keeps a low temperature and a threshold quiet speech can cross")
 check(!zhipuSetupText.contains("googleapis.com") && !zhipuSetupText.contains("models/"), "Zhipu session never carries a Google host or model path")
 let zhipuTools = (zhipuSession["tools"] as? [[String: Any]])?.map { $0["name"] as? String }
 check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["instructions"] as? String)?.contains("前进") == true && zhipuTools == ["drive", "run_scenario", "search_memory"], "Zhipu keeps the Gemini prompt and adds the car drive tool")
 check(!zhipuSetupText.contains("OBJECT") && !zhipuSetupText.contains("nullable"), "Zhipu tool parameters are JSON Schema")
 let zhipuDefaultWire = try zhipuLive.liveWire()
 check(zhipuDefaultWire.encode(.video(Data([1]))).isEmpty, "default Zhipu session does not upload camera frames")
+let pcmWire = try zhipuLive.liveWire()
+let pcmFrames = pcmWire.encode(.audio(Data([1, 2, 3, 4])))
+check(pcmFrames.count == 1 && pcmFrames.first?["audio"] as? String == "AQIDBA==", "voice-only audio stays raw PCM when the camera closes")
+check(pcmWire.encode(.commit).map { $0["type"] as? String } == ["input_audio_buffer.commit", "response.create"], "voice-only submits a finished utterance")
 let zhipuVideo = try zhipuLive.liveWire(acceptsVideo: true)
 let zhipuVideoSession = try zhipuVideo.setupMessage(template: liveTemplate, context: .init())["session"] as! [String: Any]
-check((zhipuVideoSession["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "video_passive" && zhipuVideo.encode(.video(Data([9]))).count == 1, "explicit camera opt-in accepts one video frame")
+check((zhipuVideoSession["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "video_passive" && zhipuVideo.encode(.video(Data([9]))).count == 1 && zhipuVideo.encode(.commit).isEmpty, "explicit camera opt-in accepts one video frame and submits on its own")
 let zhipuVoiceAgain = zhipuVideo.updateVideo(false).first?["session"] as? [String: Any]
 check((zhipuVoiceAgain?["beta_fields"] as? [String: Any])?["chat_mode"] as? String == "audio" && zhipuVideo.encode(.video(Data([9]))).isEmpty, "turning the camera off returns to voice-only and drops frames")
 let visualTemplate: [String: Any] = ["model": "placeholder", "systemInstruction": ["parts": [["text": "before <perception_truth>Use live camera frames for visual questions.</perception_truth> after <body_context_rules>Do not call tools because of body_context.</body_context_rules> tail"]]], "tools": []]

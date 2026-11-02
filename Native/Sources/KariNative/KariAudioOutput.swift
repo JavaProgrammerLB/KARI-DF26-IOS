@@ -28,6 +28,7 @@ final class KariAudioOutput {
     private var reconfiguring = false
     private var microphoneFrame: ((Data, Double) -> Void)?
     private var microphoneState: ((String, String) -> Void)?
+    private(set) var inputDescription = ""
     var resumeCaptureAutomatically = true
     var activate: (() throws -> Void)?
 
@@ -59,7 +60,7 @@ final class KariAudioOutput {
             } else {
                 self.interrupted = false
                 let options = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
-                if self.microphoneWanted && self.resumeCaptureAutomatically && AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume) {
+                if self.microphoneWanted && self.resumeCaptureAutomatically {
                     self.recoverMicrophone()
                 }
             }
@@ -93,7 +94,7 @@ final class KariAudioOutput {
         DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
     }
 
-    func startMicrophone(onFrame: @escaping (Data, Double) -> Void, onState: @escaping (String, String) -> Void) throws {
+    func startMicrophone(onFrame: @escaping (Data, Double) -> Void, onState: @escaping (String, String) -> Void, settle: Bool = true) throws {
         reconfiguring = true
         defer { reconfiguring = false }
         interrupted = false
@@ -102,46 +103,37 @@ final class KariAudioOutput {
         configuringSession = true
         do {
             try activate?()
-            if !voiceProcessingEnabled {
-                // Configure echo cancellation once before attaching the capture tap.
-                engine.stop()
-                stop(message: "正在切换到语音采集")
-                try engine.inputNode.setVoiceProcessingEnabled(true)
-                voiceProcessingEnabled = true
-            }
             let input = engine.inputNode
+            if engine.isRunning { engine.stop() }
+            // The hardware format is only real after the engine has run once. Read it, stop,
+            // then install the tap while stopped and start again.
+            engine.prepare(); try engine.start()
             let sourceFormat = input.outputFormat(forBus: 0)
-            guard sourceFormat.sampleRate > 0, sourceFormat.channelCount > 0,
-                  let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true),
-                  let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            engine.stop()
+            guard sourceFormat.sampleRate > 0, sourceFormat.channelCount > 0 else {
                 throw failure("麦克风格式不可用，请检查音频设备后恢复采集")
             }
+            let route = AVAudioSession.sharedInstance().currentRoute.inputs.map(\.portName).joined(separator: "、")
+            inputDescription = "\(Int(sourceFormat.sampleRate))Hz \(route)"
             let generation = microphoneGeneration
             microphoneTapStarts += 1
             input.installTap(onBus: 0, bufferSize: 2048, format: sourceFormat) { [weak self] buffer, _ in
-                let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16_000 / sourceFormat.sampleRate)) + 64
-                guard let pcm = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-                var supplied = false
-                var conversionError: NSError?
-                let result = converter.convert(to: pcm, error: &conversionError) { _, status in
-                    if supplied { status.pointee = .noDataNow; return nil }
-                    supplied = true; status.pointee = .haveData; return buffer
-                }
-                guard result != .error, conversionError == nil, pcm.frameLength > 0,
-                      let samples = pcm.int16ChannelData?[0] else { return }
-                let count = Int(pcm.frameLength)
-                let data = Data(bytes: samples, count: count * MemoryLayout<Int16>.size)
+                guard let self, let data = Self.pcm16k(buffer) else { return }
+                let count = data.count / 2
                 var sum: Double = 0
-                for index in 0..<count { let value = Double(samples[index]) / 32768; sum += value * value }
-                let level = sqrt(sum / Double(count))
+                data.withUnsafeBytes { raw in
+                    let samples = raw.bindMemory(to: Int16.self)
+                    for index in 0..<count { let value = Double(samples[index]) / 32768; sum += value * value }
+                }
+                let level = sqrt(sum / Double(max(count, 1)))
                 DispatchQueue.main.async {
-                    guard let self, self.microphoneWanted, self.microphoneGeneration == generation else { return }
+                    guard self.microphoneWanted, self.microphoneGeneration == generation else { return }
                     self.capturedPCMFrames += count
                     self.microphoneFrame?(data, level)
                 }
             }
             microphoneTapInstalled = true
-            if !engine.isRunning { engine.prepare(); try engine.start() }
+            engine.prepare(); try engine.start()
             DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
             onState("started", "")
         } catch {
@@ -149,6 +141,38 @@ final class KariAudioOutput {
             removeMicrophoneTap(); microphoneWanted = false
             throw error
         }
+    }
+
+    /// Downsample the microphone buffer to little-endian 16 kHz mono PCM.
+    private static func pcm16k(_ buffer: AVAudioPCMBuffer) -> Data? {
+        let frames = Int(buffer.frameLength)
+        let rate = buffer.format.sampleRate
+        let channels = Int(buffer.format.channelCount)
+        guard frames > 0, rate > 0, channels > 0 else { return nil }
+        var mono = [Float](repeating: 0, count: frames)
+        if let first = buffer.floatChannelData?[0] {
+            for index in 0..<frames {
+                var sample = first[index]
+                if channels > 1, let second = buffer.floatChannelData?[1] { sample = (sample + second[index]) * 0.5 }
+                mono[index] = sample
+            }
+        } else if let first = buffer.int16ChannelData?[0] {
+            for index in 0..<frames { mono[index] = Float(first[index]) / 32768 }
+        } else { return nil }
+        let outCount = max(1, Int((Double(frames) * 16_000 / rate).rounded()))
+        var data = Data(count: outCount * MemoryLayout<Int16>.size)
+        data.withUnsafeMutableBytes { raw in
+            let out = raw.bindMemory(to: Int16.self)
+            for index in 0..<outCount {
+                let position = Double(index) * rate / 16_000
+                let lower = min(frames - 1, Int(position))
+                let upper = min(frames - 1, lower + 1)
+                let fraction = Float(position - Double(lower))
+                let sample = max(-1, min(1, mono[lower] * (1 - fraction) + mono[upper] * fraction))
+                out[index] = Int16(sample * 32767)
+            }
+        }
+        return data
     }
 
     private func removeMicrophoneTap() {
@@ -170,7 +194,7 @@ final class KariAudioOutput {
         guard microphoneWanted, UIApplication.shared.applicationState == .active,
               let frame = microphoneFrame, let state = microphoneState else { return }
         state("interrupted", "音频设备发生变化，正在恢复采集…")
-        do { try startMicrophone(onFrame: frame, onState: state) }
+        do { try startMicrophone(onFrame: frame, onState: state, settle: false) }
         catch { state("error", "采集恢复失败：\(error.localizedDescription)。请点击恢复采集。") }
     }
 

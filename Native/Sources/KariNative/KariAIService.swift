@@ -33,6 +33,11 @@ import GoogleSignIn
     @Published private(set) var connecting = false
     @Published private(set) var speaking = false
     @Published private(set) var microphone = false
+    @Published private(set) var inputLevel = 0.0
+    @Published private(set) var inputDescription = ""
+    @Published private(set) var uploadedAudioFrames = 0
+    @Published private(set) var committedTurns = 0
+    @Published private(set) var serverNote = ""
     @Published private(set) var heard = ""
     @Published private(set) var reply = ""
     @Published private(set) var error = ""
@@ -107,13 +112,23 @@ import GoogleSignIn
     private(set) var uploadsVideo = true
     private var lastMotionName: String?
     private var lastMotionAt = -Double.infinity
+    private var localSpeech = false
+    private var quietSince = 0.0
+    private var utterancePeak = 0.0
+    private var uncommittedAudio = false
+    private var echoUntil = 0.0
+    private var responseOpen = false
     init() { audio.activate = { try Self.activateAudio() } }
     private static func activateAudio() throws {
         let session = AVAudioSession.sharedInstance()
-        if session.category != .playAndRecord || session.mode != .voiceChat {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
-        }
+        // Record from the iPhone microphone, the same input Voice Memos uses.
+        // voiceChat plus a headset microphone was holding the captured voice down.
+        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothA2DP])
         try session.setActive(true)
+        if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+            try session.setPreferredInput(builtIn)
+        }
+        if session.isInputGainSettable { try session.setInputGain(1) }
         if session.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) { try session.overrideOutputAudioPort(.speaker) }
     }
     func start(_ config: KariAIConfiguration, testOnly: Bool = false, captureMicrophone: Bool = true) async throws {
@@ -122,7 +137,9 @@ import GoogleSignIn
         previousPersonality = personality?() ?? ""
         previousConfig = config; previousWasTest = testOnly; previousLanguage = KariLocalization.shared.language; discardAudioUntilTurnComplete = false
         generation += 1; let token = generation
-        connecting = true; error = ""; transportDiagnostic = ""; reply = ""; heard = ""; sentVideoFrames = 0; receivedAudioChunks = 0; turnComplete = false
+        KariLiveTrace.reset()
+        connecting = true; error = ""; transportDiagnostic = ""; reply = ""; heard = ""; serverNote = ""; sentVideoFrames = 0; uploadedAudioFrames = 0; committedTurns = 0; receivedAudioChunks = 0; turnComplete = false
+        localSpeech = false; quietSince = 0; utterancePeak = 0; uncommittedAudio = false; echoUntil = 0; responseOpen = false
         receivedPCMFrames = 0; playedPCMFrames = 0; serverInterruptions = 0; completedTurns = 0; generationCompletions = 0; playbackFailures = 0; peakMicrophoneDuringPlayback = 0; microphoneFramesDuringPlayback = 0
         do {
             let credential = try await KariCredentials.token(config)
@@ -136,7 +153,18 @@ import GoogleSignIn
                         guard let self, token == self.generation else { return }
                         let data: Data
                         switch message { case .string(let text): data = Data(text.utf8); case .data(let value): data = value; @unknown default: continue }
-                        try self.receive(data, token: token)
+                        do { try self.receive(data, token: token) }
+                        catch {
+                            let text = error.localizedDescription
+                            if Self.recoverableLiveError(text) {
+                                self.serverNote = "上一轮被打断，可以继续说"
+                                self.responseOpen = false
+                                self.echoUntil = ProcessInfo.processInfo.systemUptime + 0.45
+                                KariLiveTrace.line("note \(text.prefix(180))")
+                                continue
+                            }
+                            throw error
+                        }
                     }
                 } catch { guard let self, token == self.generation else { return }; self.transportFailed(error, socket: task, prefix: "实时连接中断") }
             }
@@ -178,8 +206,22 @@ import GoogleSignIn
         guard token == generation else { throw CancellationError() }
         guard allowed else { throw KariError.message("请在 iPhone 设置中允许 KARI 使用麦克风") }
         try audio.startMicrophone(onFrame: { [weak self] data, level in
-            if let self, self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
-            self?.send(.audio(data), token: token)
+            guard let self else { return }
+            self.inputLevel = level
+            if self.inputDescription.isEmpty { self.inputDescription = self.audio.inputDescription }
+            if self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
+            let now = ProcessInfo.processInfo.systemUptime
+            if self.speaking || self.responseOpen { self.echoUntil = now + 0.45 }
+            if now < self.echoUntil {
+                self.localSpeech = false
+                self.quietSince = 0
+                self.utterancePeak = 0
+                KariLiveTrace.sample("drop-echo level=\(Int(level * 100)) playing=\(self.speaking)")
+                return
+            }
+            self.send(.audio(data), token: token)
+            self.finishVoiceTurnIfQuiet(level, token: token)
+            KariLiveTrace.sample("level=\(Int(level * 100)) peak=\(Int(self.utterancePeak * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames) commit=\(self.committedTurns) route=\(self.inputDescription)")
         }, onState: { [weak self] type, message in
             guard let self, token == self.generation else { return }
             self.microphone = type == "started"
@@ -221,9 +263,35 @@ import GoogleSignIn
     }
     func sendFrame(_ jpeg: Data) { guard connected, uploadsVideo, queuedMessages < 6 else { return }; sentVideoFrames += 1; send(.video(jpeg), token: generation) }
     func sendText(_ text: String) { guard connected else { return }; userUtterance = text; awaitingNewUserInput = false; processing = true; send(.text(text), token: generation) }
+    /// Voice-only audio is kept until this utterance falls well below its own peak.
+    /// A fixed cutoff never arrives when the room itself stays above that cutoff.
+    private func finishVoiceTurnIfQuiet(_ level: Double, token: Int) {
+        guard !uploadsVideo, uncommittedAudio else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if level > utterancePeak { utterancePeak = level }
+        let talking = utterancePeak > 0.05 && level > utterancePeak * 0.7
+        if talking {
+            localSpeech = true
+            quietSince = 0
+            return
+        }
+        guard localSpeech else { utterancePeak = max(level, utterancePeak * 0.98); return }
+        if quietSince == 0 { quietSince = now; return }
+        guard now - quietSince >= 0.5 else { return }
+        localSpeech = false
+        quietSince = 0
+        utterancePeak = level
+        KariLiveTrace.line("commit playing=\(speaking) upload=\(uploadedAudioFrames)")
+        send(.commit, token: token)
+    }
     private func send(_ command: KariLiveCommand, token: Int) {
         guard let wire else { return }
-        for frame in wire.encode(command) { enqueue(frame, token: token) }
+        for frame in wire.encode(command) {
+            if frame["type"] as? String == "input_audio_buffer.append" { uploadedAudioFrames += 1; uncommittedAudio = true }
+            if frame["type"] as? String == "input_audio_buffer.commit" { committedTurns += 1; uncommittedAudio = false }
+            if frame["type"] as? String == "response.create" { responseOpen = true }
+            enqueue(frame, token: token)
+        }
     }
     private func enqueue(_ object: [String: Any], token: Int) {
         guard token == generation, let socket, let data = try? JSONSerialization.data(withJSONObject: object), let text = String(data: data, encoding: .utf8) else { return }
@@ -238,6 +306,9 @@ import GoogleSignIn
     }
     private func receive(_ data: Data, token: Int) throws {
         guard let wire, let message = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let type = message["type"] as? String, type != "response.audio.delta" {
+            KariLiveTrace.line("server \(type) \(KariLiveTrace.brief(message))")
+        }
         for event in try wire.decode(message) { apply(event, token: token) }
     }
     private func apply(_ event: KariLiveEvent, token: Int) {
@@ -246,6 +317,7 @@ import GoogleSignIn
         case .resumable(let handle): resumeHandle = handle
         case .interrupted: onMemoryCancel?(); serverInterruptions += 1; playbackGeneration += 1; audio.stop(); audioBuffers = 0; speaking = false; discardAudioUntilTurnComplete = false
         case .heard(let text):
+            serverNote = ""
             processing = true
             if awaitingNewUserInput { userUtterance = ""; awaitingNewUserInput = false }
             if userUtterance.count < 2000 { userUtterance += text }
@@ -270,7 +342,10 @@ import GoogleSignIn
                 }
             } } catch { playbackFailed(error) }
         case .generationComplete: generationCompletions += 1
-        case .turnComplete: awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
+        case .turnComplete:
+            awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
+            responseOpen = false
+            echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.45)
         case .toolCalls(let calls): runTools(calls, token: token)
         case .toolCancellation(let ids):
             cancelledToolIDs.formUnion(ids)
@@ -317,7 +392,7 @@ import GoogleSignIn
     }
     private func transportFailed(_ failure: Error, socket: URLSessionWebSocketTask, prefix: String) {
         var details = ["\((failure as NSError).domain):\((failure as NSError).code)"]
-        if let response = socket.response as? HTTPURLResponse { details.append("HTTP \(response.statusCode)") }
+        if let response = socket.response as? HTTPURLResponse, response.statusCode != 101 { details.append("HTTP \(response.statusCode)") }
         if socket.closeCode != .invalid { details.append("WS \(socket.closeCode.rawValue)") }
         if let reason = socket.closeReason.flatMap({ String(data: $0, encoding: .utf8) }), !reason.isEmpty { details.append(String(reason.prefix(800))) }
         transportDiagnostic = KariAIRequest.redact(details.joined(separator: " · "))
@@ -326,6 +401,12 @@ import GoogleSignIn
         } else {
             fail("\(prefix)：\(failure.localizedDescription) [\(transportDiagnostic)]")
         }
+    }
+    /// WebSocket 握手成功就是 HTTP 101。服务端取消半截回答时也会回这条，不能据此拆掉会话。
+    private static func recoverableLiveError(_ text: String) -> Bool {
+        let folded = text.lowercased()
+        if folded.contains("denied") || folded.contains("unauthorized") || folded.contains("api key") || folded.contains("quota") || text.contains("鉴权") || text.contains("余额") { return false }
+        return folded.contains("context canceled") || folded.contains("context cancelled") || folded.contains("request failed") || folded.contains("asr") || folded.contains("commit") || folded.contains("buffer") || folded.contains("vad")
     }
     private func fail(_ reason: String) {
         let clean = KariAIRequest.redact(reason)
@@ -358,5 +439,36 @@ import GoogleSignIn
             do { try audio.test { result in continuation.resume(with: result.map { _ in () }) } }
             catch { continuation.resume(throwing: error) }
         }
+    }
+}
+
+enum KariLiveTrace {
+    static let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("live-debug.log")
+    private static var lastSample = 0.0
+    static func reset() { try? Data("start\n".utf8).write(to: url) }
+    static func line(_ text: String) {
+        let row = String(format: "%.3f %@\n", ProcessInfo.processInfo.systemUptime, text)
+        guard let data = row.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else { try? data.write(to: url) }
+    }
+    static func sample(_ text: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastSample >= 1 else { return }
+        lastSample = now
+        line(text)
+    }
+    static func brief(_ message: [String: Any]) -> String {
+        if let error = message["error"] as? [String: Any], let text = error["message"] as? String { return text }
+        if let text = message["transcript"] as? String { return String(text.prefix(80)) }
+        if let text = message["delta"] as? String, message["type"] as? String == "response.audio_transcript.delta" { return String(text.prefix(80)) }
+        if let item = message["item"] as? [String: Any], let parts = item["content"] as? [[String: Any]] {
+            let text = parts.compactMap { $0["transcript"] as? String }.joined()
+            if !text.isEmpty { return String(text.prefix(80)) }
+        }
+        return ""
     }
 }

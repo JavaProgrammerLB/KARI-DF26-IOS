@@ -30,6 +30,7 @@ enum KariLiveCommand {
     case video(Data)
     case text(String)
     case toolResults([KariLiveToolResult])
+    case commit
 }
 
 struct KariLiveSessionContext {
@@ -104,6 +105,7 @@ fileprivate struct GeminiLiveWire: KariLiveWire {
         case .video(let jpeg): return [["realtimeInput": ["video": ["data": jpeg.base64EncodedString(), "mimeType": "image/jpeg"]]]]
         case .text(let text): return [["clientContent": ["turns": [["role": "user", "parts": [["text": text]]]], "turnComplete": true]]]
         case .toolResults(let results): return [["toolResponse": ["functionResponses": results.map { ["id": $0.id, "name": $0.name, "response": $0.response] }]]]
+        case .commit: return []
         }
     }
     func decode(_ message: [String: Any]) throws -> [KariLiveEvent] {
@@ -205,11 +207,11 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
             "model": model.id, "voice": voice,
             "instructions": testOnly ? baseInstructions : Self.spokenInstructions(baseInstructions, video: video),
             "tools": tools,
-            // Bare pcm is 16 kHz on this API, which matches the microphone converter.
+            // Closing the camera must keep the raw PCM upload that already hears speech.
             "modalities": ["text", "audio"], "input_audio_format": "pcm", "output_audio_format": "pcm",
             "temperature": 0.2,
-            // Match Gemini's slower end-of-speech so a short command is not split, and keep server VAD across updates.
-            "turn_detection": ["type": "server_vad", "interrupt_response": true, "prefix_padding_ms": 300, "silence_duration_ms": 700],
+            // The service default of 0.5 ignores the quiet level this phone actually captures.
+            "turn_detection": ["type": "server_vad", "interrupt_response": true, "prefix_padding_ms": 300, "silence_duration_ms": 700, "threshold": 0.15],
             // auto_search defaults on in the vendor docs and adds a server search tool. Function calls are documented for audio only.
             "beta_fields": ["chat_mode": video ? "video_passive" : "audio", "auto_search": false]
         ]
@@ -235,7 +237,12 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
     }
     func encode(_ command: KariLiveCommand) -> [[String: Any]] {
         switch command {
-        case .audio(let pcm): return [["type": "input_audio_buffer.append", "audio": pcm.base64EncodedString()]]
+        case .audio(let pcm):
+            return [["type": "input_audio_buffer.append", "audio": pcm.base64EncodedString()]]
+        case .commit:
+            // Video frames already make the server submit the turn. Voice-only has to submit it.
+            guard !acceptsVideo else { return [] }
+            return [["type": "input_audio_buffer.commit"], ["type": "response.create"]]
         case .video(let jpeg):
             guard acceptsVideo, !testOnly else { return [] }
             return [["type": "input_audio_buffer.append_video_frame", "video_frame": jpeg.base64EncodedString()]]

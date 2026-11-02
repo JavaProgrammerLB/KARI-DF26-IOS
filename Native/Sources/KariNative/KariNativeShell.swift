@@ -88,6 +88,27 @@ struct KariRootView: View {
                         KariCompanionCameraWindow(camera: app.camera).frame(width: 130, height: 98)
                             .clipShape(RoundedRectangle(cornerRadius: 14)).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(12).allowsHitTesting(false)
                     }
+                    if app.phase == .active && app.settings.configuration.isLive {
+                        VStack {
+                            Text(app.live.microphone
+                                 ? "麦克风\(app.live.inputLevel > 0.08 ? "有声音" : app.live.inputLevel > 0.02 ? "太轻" : "静音") \(Int(app.live.inputLevel * 100)) 上传\(app.live.uploadedAudioFrames) 提交\(app.live.committedTurns)"
+                                 : "麦克风未打开")
+                                .font(.caption2).foregroundStyle(.white)
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(.black.opacity(0.55), in: Capsule())
+                            if !app.live.serverNote.isEmpty {
+                                Text(app.live.serverNote).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                                    .padding(.horizontal, 10).padding(.vertical, 4)
+                                    .background(.black.opacity(0.55), in: Capsule())
+                            }
+                            if !app.live.heard.isEmpty {
+                                Text("听到：" + app.live.heard).font(.caption2).foregroundStyle(.white).lineLimit(1)
+                                    .padding(.horizontal, 10).padding(.vertical, 4)
+                                    .background(.black.opacity(0.55), in: Capsule())
+                            }
+                            Spacer()
+                        }.padding(.top, 8).allowsHitTesting(false)
+                    }
                     if controlsVisible || !app.liveFailure.isEmpty || app.wake.phase == .waiting || app.wake.phase == .connecting || app.wake.phase == .suspended || !app.settings.configuration.isLive || app.phase != .active || UIAccessibility.isVoiceOverRunning {
                         activeControls
                         VStack { HStack { Spacer(); KariCompanionStopButton(app: app) }; Spacer() }.padding(12)

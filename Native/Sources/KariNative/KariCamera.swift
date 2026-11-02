@@ -79,6 +79,17 @@ final class KariCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         frameLock.lock(); acceptingFrames = false; latestFrame = nil; frameLock.unlock()
         captureQueue.async { self.session.stopRunning() }
     }
+    /// Returns after the capture session has released the microphone.
+    @MainActor func stopAndWait() async {
+        intent += 1; running = false
+        frameLock.lock(); acceptingFrames = false; latestFrame = nil; frameLock.unlock()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            captureQueue.async {
+                if self.session.isRunning { self.session.stopRunning() }
+                continuation.resume()
+            }
+        }
+    }
     @MainActor func updateOrientation() {
         let interface = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation ?? .portrait
         let orientation = Self.captureOrientation(interface)

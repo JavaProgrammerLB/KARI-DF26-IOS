@@ -160,6 +160,11 @@ import Combine
                 }
             }
             guard current == token, !Task.isCancelled else { return }
+            if live.connected && config.provider == "zhipu" && config.isLive && !camera.running {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard current == token, !Task.isCancelled else { return }
+                try? await live.recoverMicrophone()
+            }
             settings.motionEnabled = !(config.isLive && companion.wakeSettings.enabled)
             phase = .active
             let failures = [liveConnectionFailure, cameraNotice].filter { !$0.isEmpty }
@@ -250,7 +255,12 @@ import Combine
         cameraEnabled.toggle()
         if !cameraEnabled {
             if zhipuVoice { zhipuCameraOptIn = false; live.setUploadsVideo(false) }
-            companion.cameraChanged(); camera.stop(); return
+            companion.cameraChanged()
+            operation = Task {
+                await camera.stopAndWait()
+                if live.connected { try? await live.recoverMicrophone() }
+            }
+            return
         }
         operation = Task {
             do { try await camera.start(front: camera.front); if zhipuVoice { zhipuCameraOptIn = true; live.setUploadsVideo(true) } }
