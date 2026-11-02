@@ -43,10 +43,12 @@ protocol KariLiveWire {
     func setupMessage(template: [String: Any], context: KariLiveSessionContext) -> [String: Any]
     func encode(_ command: KariLiveCommand) -> [[String: Any]]
     func decode(_ message: [String: Any]) throws -> [KariLiveEvent]
+    /// Empty when the provider always accepts frames or the session is a connectivity test.
+    func updateVideo(_ enabled: Bool) -> [[String: Any]]
 }
 
 extension KariAIConfiguration {
-    func liveWire(testOnly: Bool = false) throws -> any KariLiveWire {
+    func liveWire(testOnly: Bool = false, acceptsVideo: Bool = false) throws -> any KariLiveWire {
         guard let offer = preset.live else { throw KariError.message("当前提供商不支持实时语音") }
         switch offer.transport {
         case .geminiDeveloper:
@@ -60,7 +62,7 @@ extension KariAIConfiguration {
                                   model: "projects/\(project)/locations/\(region)/publishers/google/models/\(try KariAIRequest.identifier(liveModel))", oauth: auth == "oauth", testOnly: testOnly)
         case .zhipu:
             let resolved = voice.flatMap { offer.voices.contains($0) ? $0 : nil } ?? offer.voices[0]
-            return ZhipuLiveWire(model: try ZhipuModel(liveModel), voice: resolved, testOnly: testOnly)
+            return ZhipuLiveWire(model: try ZhipuModel(liveModel), voice: resolved, testOnly: testOnly, acceptsVideo: acceptsVideo)
         }
     }
 }
@@ -126,6 +128,7 @@ fileprivate struct GeminiLiveWire: KariLiveWire {
         if let cancellation = message["toolCallCancellation"] as? [String: Any] { events.append(.toolCancellation(Set(cancellation["ids"] as? [String] ?? []))) }
         return events
     }
+    func updateVideo(_: Bool) -> [[String: Any]] { [] }
 }
 
 fileprivate struct ZhipuModel {
@@ -133,10 +136,22 @@ fileprivate struct ZhipuModel {
     init(_ raw: String) throws { id = try KariAIRequest.identifier(raw) }
 }
 
-fileprivate struct ZhipuLiveWire: KariLiveWire {
+// Reference type so a camera toggle can change the same session the socket is using.
+// Zhipu documents function calling for voice calls only, and bills every attached video frame.
+fileprivate final class ZhipuLiveWire: KariLiveWire {
     let model: ZhipuModel
     let voice: String
     let testOnly: Bool
+    private var acceptsVideo: Bool
+    private var baseInstructions = ""
+    private var tools: [[String: Any]] = []
+
+    init(model: ZhipuModel, voice: String, testOnly: Bool, acceptsVideo: Bool) {
+        self.model = model
+        self.voice = voice
+        self.testOnly = testOnly
+        self.acceptsVideo = testOnly ? false : acceptsVideo
+    }
 
     func connectRequest(credential: String) -> URLRequest {
         var request = URLRequest(url: URL(string: "wss://open.bigmodel.cn/api/paas/v4/realtime")!)
@@ -146,18 +161,18 @@ fileprivate struct ZhipuLiveWire: KariLiveWire {
     func setupMessage(template: [String: Any], context: KariLiveSessionContext) -> [String: Any] {
         let composed = composedSetup(template, model: model.id, testOnly: testOnly, context: context)
         let parts = (composed["systemInstruction"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []
-        let instructions = parts.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        baseInstructions = parts.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }.joined(separator: "\n\n")
         let declarations = (composed["tools"] as? [[String: Any]] ?? []).flatMap { $0["functionDeclarations"] as? [[String: Any]] ?? [] }
-        let tools: [[String: Any]] = declarations.map { declaration in
+        tools = declarations.map { declaration in
             ["type": "function", "name": declaration["name"] ?? "", "description": declaration["description"] ?? "", "parameters": Self.jsonSchema(declaration["parameters"] ?? [:])]
         }
-        let session: [String: Any] = [
-            "model": model.id, "voice": voice, "instructions": instructions, "tools": tools,
-            "modalities": ["text", "audio"], "input_audio_format": "pcm", "output_audio_format": "pcm",
-            "turn_detection": ["type": "server_vad", "interrupt_response": true],
-            "beta_fields": ["chat_mode": testOnly ? "audio" : "video_passive"]
-        ]
-        return ["type": "session.update", "session": session]
+        if !testOnly { tools.insert(Self.driveTool, at: 0) }
+        return ["type": "session.update", "session": sessionPayload()]
+    }
+    func updateVideo(_ enabled: Bool) -> [[String: Any]] {
+        guard !testOnly else { return [] }
+        acceptsVideo = enabled
+        return [["type": "session.update", "session": sessionPayload()]]
     }
     // Gemini declarations use OpenAPI-style uppercase types and `nullable`; Zhipu expects JSON Schema.
     private static func jsonSchema(_ value: Any) -> Any {
@@ -169,10 +184,61 @@ fileprivate struct ZhipuLiveWire: KariLiveWire {
         }
         return result
     }
+    private static let driveTool: [String: Any] = [
+        "type": "function", "name": "drive",
+        "description": "Move the car the moment the user clearly asks to go forward, back up, turn left, or turn right. Call this instead of only agreeing in speech.",
+        "parameters": [
+            "type": "object",
+            "properties": [
+                "direction": [
+                    "type": "string",
+                    "enum": ["前进", "后退", "左转", "右转"],
+                    "description": "前进 moves closer, 后退 backs up, 左转 turns left, 右转 turns right."
+                ]
+            ],
+            "required": ["direction"]
+        ]
+    ]
+    private func sessionPayload() -> [String: Any] {
+        let video = acceptsVideo && !testOnly
+        return [
+            "model": model.id, "voice": voice,
+            "instructions": testOnly ? baseInstructions : Self.spokenInstructions(baseInstructions, video: video),
+            "tools": tools,
+            // Bare pcm is 16 kHz on this API, which matches the microphone converter.
+            "modalities": ["text", "audio"], "input_audio_format": "pcm", "output_audio_format": "pcm",
+            "temperature": 0.2,
+            // Match Gemini's slower end-of-speech so a short command is not split, and keep server VAD across updates.
+            "turn_detection": ["type": "server_vad", "interrupt_response": true, "prefix_padding_ms": 300, "silence_duration_ms": 700],
+            // auto_search defaults on in the vendor docs and adds a server search tool. Function calls are documented for audio only.
+            "beta_fields": ["chat_mode": video ? "video_passive" : "audio", "auto_search": false]
+        ]
+    }
+    private static func spokenInstructions(_ base: String, video: Bool) -> String {
+        var text = base
+        if !video {
+            text = text.replacingOccurrences(of: "(?s)<perception_truth>.*?</perception_truth>\\n?", with: "", options: .regularExpression)
+            text = text.replacingOccurrences(of: "(?s)<body_context_rules>.*?</body_context_rules>\\n?", with: "", options: .regularExpression)
+        }
+        text = text.replacingOccurrences(of: "You have one tool: run_scenario.", with: "Use drive for 前进, 后退, 左转, and 右转. Use run_scenario for every other approved scenario.")
+        let camera = video ? "The camera is on. Describe only what a new frame shows." : "The camera is off. Do not claim you can see the user, the room, or any object."
+        text += """
+
+        <car_motion>
+        This device is a small car. When the user clearly asks to move, call drive immediately. direction must be exactly 前进, 后退, 左转, or 右转.
+        前进, 向前, 往前, and 向前走 use 前进. 后退, 向后, 往后, and 向后走 use 后退. 左转, 向左, and 往左 use 左转. 右转, 向右, and 往右 use 右转.
+        Do not answer these four commands with speech alone. Prefer the tool call and no extra speech.
+        \(camera) Do not search the web.
+        </car_motion>
+        """
+        return text
+    }
     func encode(_ command: KariLiveCommand) -> [[String: Any]] {
         switch command {
         case .audio(let pcm): return [["type": "input_audio_buffer.append", "audio": pcm.base64EncodedString()]]
-        case .video(let jpeg): return testOnly ? [] : [["type": "input_audio_buffer.append_video_frame", "video_frame": jpeg.base64EncodedString()]]
+        case .video(let jpeg):
+            guard acceptsVideo, !testOnly else { return [] }
+            return [["type": "input_audio_buffer.append_video_frame", "video_frame": jpeg.base64EncodedString()]]
         case .text(let text):
             return [["type": "conversation.item.create", "item": ["type": "message", "role": "user", "content": [["type": "input_text", "text": text]]]],
                     ["type": "response.create"]]
@@ -192,15 +258,25 @@ fileprivate struct ZhipuLiveWire: KariLiveWire {
         case "session.updated": return [.ready]
         case "input_audio_buffer.speech_started": return [.interrupted]
         case "conversation.item.input_audio_transcription.completed": return (message["transcript"] as? String).map { [.heard($0)] } ?? []
+        case "conversation.item.created":
+            guard ((message["item"] as? [String: Any])?["role"] as? String) == "user" else { return [] }
+            let parts = (message["item"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+            return parts.compactMap { part in (part["transcript"] as? String).flatMap { $0.isEmpty ? nil : $0 } }.map { .heard($0) }
         case "response.audio_transcript.delta": return (message["delta"] as? String).map { [.reply($0)] } ?? []
         case "response.audio.delta": return (message["delta"] as? String).flatMap { Data(base64Encoded: $0) }.map { [.audio($0)] } ?? []
         case "response.audio.done": return [.generationComplete]
         case "response.done": return [.turnComplete]
         case "response.function_call_arguments.done":
-            let arguments = (message["arguments"] as? String)?.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-            let callID = (message["call_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (message["item_id"] as? String) ?? ""
-            return [.toolCalls([.init(id: callID, name: message["name"] as? String ?? "", arguments: arguments)])]
+            return [.toolCalls([Self.toolCall(message)])]
         default: return []
         }
+    }
+    private static func toolCall(_ message: [String: Any]) -> KariLiveToolCall {
+        let arguments: [String: Any]?
+        if let object = message["arguments"] as? [String: Any] { arguments = object }
+        else if let text = message["arguments"] as? String { arguments = text.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } }
+        else { arguments = nil }
+        let callID = (message["call_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (message["item_id"] as? String) ?? ""
+        return .init(id: callID, name: message["name"] as? String ?? "", arguments: arguments)
     }
 }

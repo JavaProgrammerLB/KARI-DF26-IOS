@@ -103,6 +103,10 @@ import GoogleSignIn
     private var previousLanguage: String?
     private var discardAudioUntilTurnComplete = false
     private var wire: (any KariLiveWire)?
+    /// Gemini always uploads while the camera runs. Zhipu stays voice-only until the user opts in.
+    private(set) var uploadsVideo = true
+    private var lastMotionName: String?
+    private var lastMotionAt = -Double.infinity
     init() { audio.activate = { try Self.activateAudio() } }
     private static func activateAudio() throws {
         let session = AVAudioSession.sharedInstance()
@@ -123,7 +127,7 @@ import GoogleSignIn
         do {
             let credential = try await KariCredentials.token(config)
             guard token == generation else { throw CancellationError() }
-            let wire = try config.liveWire(testOnly: testOnly); self.wire = wire
+            let wire = try config.liveWire(testOnly: testOnly, acceptsVideo: !testOnly && uploadsVideo); self.wire = wire
             let task = session.webSocketTask(with: wire.connectRequest(credential: credential)); task.maximumMessageSize = 4_000_000; socket = task; task.resume()
             receiver = Task { [weak self] in
                 do {
@@ -151,6 +155,10 @@ import GoogleSignIn
             }
             guard token == generation else { throw CancellationError() }
             connected = true; connecting = false
+            // A camera toggle during setup cannot see the socket yet. Reconcile once the session is ready.
+            if uploadsVideo != !wire.encode(.video(Data())).isEmpty {
+                for frame in wire.updateVideo(uploadsVideo) { enqueue(frame, token: token) }
+            }
             if !testOnly && captureMicrophone && !externalCapture { try await startMicrophone(token: token) }
             ping = Task { [weak self] in
                 while !Task.isCancelled {
@@ -205,7 +213,13 @@ import GoogleSignIn
         }
     }
     func recoverMicrophone() async throws { audio.stopMicrophone(); microphone = false; guard connected else { return }; try await startMicrophone(token: generation) }
-    func sendFrame(_ jpeg: Data) { guard connected, queuedMessages < 6 else { return }; sentVideoFrames += 1; send(.video(jpeg), token: generation) }
+    func setUploadsVideo(_ enabled: Bool) {
+        let changed = uploadsVideo != enabled
+        uploadsVideo = enabled
+        guard changed, connected, let wire else { return }
+        for frame in wire.updateVideo(enabled) { enqueue(frame, token: generation) }
+    }
+    func sendFrame(_ jpeg: Data) { guard connected, uploadsVideo, queuedMessages < 6 else { return }; sentVideoFrames += 1; send(.video(jpeg), token: generation) }
     func sendText(_ text: String) { guard connected else { return }; userUtterance = text; awaitingNewUserInput = false; processing = true; send(.text(text), token: generation) }
     private func send(_ command: KariLiveCommand, token: Int) {
         guard let wire else { return }
@@ -237,7 +251,7 @@ import GoogleSignIn
             if userUtterance.count < 2000 { userUtterance += text }
             heard = String((heard + text).suffix(1500))
             if KariAIRequest.isStopRequest(text) { onImmediateStop?() }
-            else if let name = KariMemoryActionPolicy.scenario(for: text), let run = onScenario {
+            else if let name = KariMemoryActionPolicy.scenario(for: text), claimMotion(name), let run = onScenario {
                 Task { try? await run(name) }
             }
         case .reply(let text): reply = String((reply + text).suffix(3000))
@@ -267,7 +281,7 @@ import GoogleSignIn
     private func runTools(_ calls: [KariLiveToolCall], token: Int) {
         for call in calls {
             if call.name == "search_memory" { memoryToolIDs.insert(call.id); memoryHasBeenUsed = true }
-            if call.name == "run_scenario" { scenarioToolIDs.insert(call.id) }
+            if call.name == "run_scenario" || call.name == "drive" { scenarioToolIDs.insert(call.id) }
         }
         Task { [weak self] in
             guard let self else { return }; var results: [KariLiveToolResult] = []
@@ -280,11 +294,12 @@ import GoogleSignIn
                     if call.name == "search_memory" {
                         guard let query = args["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, query.count <= 2000, let search = self.onMemorySearch else { throw KariError.message("记忆检索参数无效") }
                         response["results"] = try await search(query)
-                    } else {
-                        guard call.name == "run_scenario", let name = args["name"] as? String, let run = self.onScenario else { throw KariError.message("未知动作请求") }
+                    } else if call.name == "run_scenario" || call.name == "drive" {
+                        let raw = (call.name == "drive" ? args["direction"] : args["name"]) as? String ?? ""
+                        guard let name = KariMemoryActionPolicy.resolveToolScenario(raw), let run = self.onScenario else { throw KariError.message("未知动作请求") }
                         guard !self.memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(self.userUtterance) else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
-                        try await run(name)
-                    }
+                        if self.claimMotion(name) { try await run(name) }
+                    } else { throw KariError.message("未知动作请求") }
                 } catch { response = ["ok": false, "reason": error.localizedDescription] }
                 self.memoryToolIDs.remove(call.id)
                 if !self.cancelledToolIDs.contains(call.id) { results.append(.init(id: call.id, name: call.name, response: response)) }
@@ -329,7 +344,14 @@ import GoogleSignIn
             endSharedCapture(); audio.shutdown(); try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }
         if clearResume { resumeHandle = nil; memoryHasBeenUsed = false }
-        userUtterance = ""; awaitingNewUserInput = true
+        userUtterance = ""; awaitingNewUserInput = true; lastMotionName = nil; lastMotionAt = -Double.infinity
+    }
+    /// Tool calls and the transcript can both name the same move. A second copy inside this window is the echo, not a new command.
+    private func claimMotion(_ name: String) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastMotionName == name, now - lastMotionAt < 2 { return false }
+        lastMotionName = name; lastMotionAt = now
+        return true
     }
     func testTone() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

@@ -29,7 +29,7 @@ struct KariCompanionControls: View {
                 .font(.footnote).foregroundStyle(app.liveFailure.isEmpty ? Color.secondary : Color.orange).lineLimit(app.liveFailure.isEmpty && landscape ? 1 : 3)
                 .frame(maxWidth: .infinity).accessibilityIdentifier("runtimeNotice")
             HStack(spacing: landscape ? 12 : 18) {
-                control(app.cameraEnabled ? L("关闭相机") : L("开启相机"), icon: camera.running ? "video.fill" : "video.slash", action: app.toggleCamera)
+                control(app.zhipuVoice && !live.uploadsVideo ? L("开启实时画面") : (app.cameraEnabled ? L("关闭相机") : L("开启相机")), icon: camera.running ? "video.fill" : "video.slash", action: app.toggleCamera)
                 control(L("切换镜头"), icon: "arrow.triangle.2.circlepath.camera", action: app.switchCamera)
                 control(L("测试声音"), icon: "speaker.wave.2", action: app.testSound)
                 if app.isActive {
