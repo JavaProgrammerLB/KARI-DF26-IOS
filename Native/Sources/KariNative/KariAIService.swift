@@ -211,17 +211,21 @@ import GoogleSignIn
             if self.inputDescription.isEmpty { self.inputDescription = self.audio.inputDescription }
             if self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
             let now = ProcessInfo.processInfo.systemUptime
-            if self.speaking || self.responseOpen { self.echoUntil = now + 0.45 }
-            if now < self.echoUntil {
+            switch LiveMicGate.disposition(speaking: self.speaking, responseOpen: self.responseOpen, now: now, echoUntil: self.echoUntil) {
+            case .drop:
                 self.localSpeech = false
                 self.quietSince = 0
                 self.utterancePeak = 0
                 KariLiveTrace.sample("drop-echo level=\(Int(level * 100)) playing=\(self.speaking)")
                 return
+            case .holdLocalTurn:
+                self.send(.audio(data), token: token)
+                KariLiveTrace.sample("barge level=\(Int(level * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames)")
+            case .upload:
+                self.send(.audio(data), token: token)
+                self.finishVoiceTurnIfQuiet(level, token: token)
+                KariLiveTrace.sample("level=\(Int(level * 100)) peak=\(Int(self.utterancePeak * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames) commit=\(self.committedTurns) route=\(self.inputDescription)")
             }
-            self.send(.audio(data), token: token)
-            self.finishVoiceTurnIfQuiet(level, token: token)
-            KariLiveTrace.sample("level=\(Int(level * 100)) peak=\(Int(self.utterancePeak * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames) commit=\(self.committedTurns) route=\(self.inputDescription)")
         }, onState: { [weak self] type, message in
             guard let self, token == self.generation else { return }
             self.microphone = type == "started"
