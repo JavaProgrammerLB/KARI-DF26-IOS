@@ -145,6 +145,7 @@ enum KariEmbeddingURL {
 enum KariMemoryActionPolicy {
     static func isDirectCommand(_ text: String) -> Bool {
         guard text.count <= 240 else { return false }
+        if MotionPlan.parse(utterance: text) != nil { return true }
         let value = text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
         let chinese = "^(?:你好卡里|嘿卡里|kari|卡里)?(?:请你|请|帮我|给我|麻烦你)?(?:往前走|往后走|往后退|向后退|向前走|向后走|往左转|往右转|向左转|向右转|前进|后退|往前|往后|向前|向后|往左|往右|向左|向右|左转|右转|转一圈|转圈|跳舞|动一动|做个动作|打个招呼|眨眨眼|眨眼|笑一下|开心一点)(?:一下|一点|一会儿|两步|一次|一圈|[0-9一二三四五六七八九十]+(?:秒|度|步))?(?:吧|好吗|可以吗)?$"
         let english = "^(?:heykari|kari)?(?:please)?(?:moveforward|goforward|movebackward|gobackward|turnleft|turnright|spin|dance|wave|blink|smile)(?:abit|alittle|once|for[0-9]+seconds?)?(?:please)?$"
