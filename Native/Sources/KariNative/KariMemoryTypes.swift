@@ -151,19 +151,10 @@ enum KariMemoryActionPolicy {
         let english = "^(?:heykari|kari)?(?:please)?(?:moveforward|goforward|movebackward|gobackward|turnleft|turnright|spin|dance|wave|blink|smile)(?:abit|alittle|once|for[0-9]+seconds?)?(?:please)?$"
         return value.range(of: chinese, options: .regularExpression) != nil || value.range(of: english, options: .regularExpression) != nil
     }
-    static func scenario(for text: String) -> String? {
-        guard isDirectCommand(text) else { return nil }
-        let value = text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
-        let commands = [("往后走", "back_up"), ("往后退", "back_up"), ("向后走", "back_up"), ("向后退", "back_up"), ("往后", "back_up"), ("向后", "back_up"), ("后退", "back_up"), ("movebackward", "back_up"), ("gobackward", "back_up"),
-                        ("往前走", "come_closer"), ("向前走", "come_closer"), ("往前", "come_closer"), ("向前", "come_closer"), ("前进", "come_closer"), ("moveforward", "come_closer"), ("goforward", "come_closer"),
-                        ("往左转", "look_left"), ("向左转", "look_left"), ("往左", "look_left"), ("向左", "look_left"), ("左转", "look_left"), ("turnleft", "look_left"),
-                        ("往右转", "look_right"), ("向右转", "look_right"), ("往右", "look_right"), ("向右", "look_right"), ("右转", "look_right"), ("turnright", "look_right")]
-        return commands.first { value.contains($0.0) }?.1
-    }
-    /// Maps a tool argument to a face scenario. Chinese motion phrases use the direct-command check; other scenario ids pass through unchanged.
+    /// Maps a tool argument to a face scenario. A Chinese direction name maps to its catalog pulse; other scenario ids pass through unchanged.
     static func resolveToolScenario(_ raw: String) -> String? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let motion = scenario(for: value) { return motion }
+        if let direction = MotionDirection(rawValue: value) { return direction.scenario }
         let normalized = value.lowercased().filter { $0.isLetter || $0.isNumber || $0 == "_" }
         guard normalized.range(of: "^[a-z][a-z0-9_]{0,48}$", options: .regularExpression) != nil else { return nil }
         return normalized

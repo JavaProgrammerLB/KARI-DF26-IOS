@@ -98,11 +98,16 @@ import Combine
             guard let self else { throw CancellationError() }
             return try await self.sendBodyCommand(payload, runID: runID)
         }
-        live.onScenario = { [weak self] name in
+        live.onAction = { [weak self] action in
             guard let self, self.phase == .active else { throw KariError.message("陪伴尚未开始") }
             guard !self.remote.presented else { throw KariError.message("手动遥控中，AI 身体动作已暂停") }
-            try await self.runScenario(name)
+            try await self.perform(action)
         }
+        live.planMotion = { [weak self] utterance in
+            guard let self else { throw CancellationError() }
+            return try await self.planMotion(utterance)
+        }
+        live.onInterrupt = { [weak self] in self?.motion.stopCurrent(source: .explicit) }
         live.onCancel = { [weak self] in
             self?.motion.invalidate(); guard self?.remote.presented != true else { return }
             Task { _ = await self?.motion.stop() }
@@ -304,6 +309,35 @@ import Combine
             stopBodyImmediately()
         }
     }
+    func perform(_ action: KariAction) async throws {
+        if let plan = action.motionPlan { try await run(plan) }
+        else if case .scenario(let name) = action { try await runScenario(name) }
+    }
+    private func run(_ plan: MotionPlan) async throws {
+        guard !remote.presented, !companion.follow.enabled else { throw PolicyError.busy }
+        let lease = try await motion.acquire(.explicit)
+        let id = UUID().uuidString
+        sceneID = id; sceneLease = lease; scenarioBusy = true
+        defer { motion.release(lease); if sceneID == id { sceneID = nil; sceneLease = nil; scenarioBusy = false } }
+        do {
+            for step in plan.steps {
+                for _ in 0..<step.count.value {
+                    try Task.checkCancellation()
+                    guard motion.valid(lease), phase == .active, settings.motionEnabled, body.isConnected else { throw PolicyError.cancelled }
+                    try await face.run(step.direction.scenario, allowMotion: true, runID: id)
+                }
+            }
+            _ = try await motion.send(["type": "stop"], lease: lease)
+        } catch { if motion.valid(lease) { _ = await motion.stop() }; throw error }
+    }
+    private func planMotion(_ utterance: String) async throws -> MotionPlan {
+        let config = settings.configuration
+        let key = try await KariCredentials.token(config)
+        let request = try KariAIRequest.text(config, key: key, prompt: utterance, systemInstruction: MotionPlan.plannerInstruction)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let reply = try KariAIRequest.response(data, status: (response as? HTTPURLResponse)?.statusCode ?? 0, provider: config.provider)
+        return try MotionPlan.parse(wire: reply).get()
+    }
     func runScenario(_ name: String, manual: Bool = false, source: MotionSource = .explicit, allowBody: Bool = true) async throws {
         guard !remote.presented, !companion.follow.enabled || source == .follow else { throw PolicyError.busy }
         guard scenarioNames.contains(name) || ["pose_neutral", "pose_attentive", "pose_curious", "pose_happy", "pose_sleepy", "pose_scared", "pose_shy"].contains(name) else { throw PolicyError.invalidProfile }
@@ -452,7 +486,12 @@ import Combine
     @discardableResult func sendText(_ text: String, includeImage: Bool = false) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         if KariAIRequest.isStopRequest(text) { companion.interact(); stopBodyImmediately(); return true }
-        if let name = KariMemoryActionPolicy.scenario(for: text), phase == .active { Task { try? await runScenario(name) } }
+        let typedPlan = live.connected ? nil : MotionPlan.parse(utterance: text)
+        switch typedPlan {
+        case .success(let plan)? where phase == .active: Task { try? await perform(.plan(plan)) }
+        case .failure(let error)?: notice = error.localizedDescription
+        default: break
+        }
         if companion.wakeSettings.enabled && settings.configuration.isLive && !wake.mayUpload { notice = "请先唤醒，再发送消息"; return false }
         companion.interact()
         if live.connected { live.sendText(text); return true }
@@ -468,11 +507,11 @@ import Combine
                 let raw = try await textRequest(text, image: image, allowActions: true, useMemory: true)
                 guard current == token, messageToken == textToken else { return }
                 let reply = KariAIRequest.companionReply(raw, allowedScenarios: scenarioNames); textReply = reply.text
-                if let scenario = reply.scenario, phase == .active {
+                if let scenario = reply.scenario, typedPlan == nil, phase == .active {
                     guard !memory.hasEnabledDocuments || KariMemoryActionPolicy.isDirectCommand(text) else {
                         textReply = L("资料问答不会执行动作，请单独下达动作指令"); return
                     }
-                    try await runScenario(scenario)
+                    try await perform(.scenario(scenario))
                 }
             }
             catch { if current == token && messageToken == textToken { notice = error.localizedDescription } }

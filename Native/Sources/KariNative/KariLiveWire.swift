@@ -16,7 +16,8 @@ enum KariLiveEvent {
     case ready
     case resumable(handle: String)
     case interrupted
-    case heard(String)
+    /// Gemini streams fragments of one utterance. Zhipu sends the completed transcript.
+    case heard(String, final: Bool)
     case reply(String)
     case audio(Data)
     case generationComplete
@@ -71,14 +72,17 @@ extension KariAIConfiguration {
 private func composedSetup(_ template: [String: Any], model: String, testOnly: Bool, context: KariLiveSessionContext) -> [String: Any] {
     var payload = KariLiveConfiguration.setup(template, model: model, testOnly: testOnly)
     guard !testOnly else { return payload }
-    var parts = (payload["systemInstruction"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []
+    var parts = ((payload["systemInstruction"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []).map { part in
+        part.mapValues { ($0 as? String)?.replacingOccurrences(of: "You have one tool: run_scenario.", with: MotionPlan.toolRule) ?? $0 }
+    }
+    parts.append(["text": MotionPlan.modelInstruction])
     parts.append(["text": context.personality])
+    var tools = [["functionDeclarations": [MotionPlan.toolDeclaration]]] + (payload["tools"] as? [[String: Any]] ?? [])
     if let memory = context.memoryInstruction {
         parts.append(["text": memory + " Use search_memory with a self-contained query before answering document or personal-memory questions. State only references returned by that tool. Never read UUID citation IDs aloud; mention document names and locations instead."])
-        var tools = payload["tools"] as? [[String: Any]] ?? []
         tools.append(["functionDeclarations": [["name": "search_memory", "description": "Search the user's imported memory documents; no physical actions.", "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "A self-contained search question"]], "required": ["query"]]]]])
-        payload["tools"] = tools
     }
+    payload["tools"] = tools
     payload["systemInstruction"] = ["parts": parts]
     return payload
 }
@@ -115,7 +119,7 @@ fileprivate struct GeminiLiveWire: KariLiveWire {
         if let resume = message["sessionResumptionUpdate"] as? [String: Any], resume["resumable"] as? Bool != false, let handle = resume["newHandle"] as? String { events.append(.resumable(handle: handle)) }
         let content = message["serverContent"] as? [String: Any] ?? [:]
         if content["interrupted"] as? Bool == true { events.append(.interrupted) }
-        if let text = (content["inputTranscription"] as? [String: Any])?["text"] as? String { events.append(.heard(text)) }
+        if let text = (content["inputTranscription"] as? [String: Any])?["text"] as? String { events.append(.heard(text, final: false)) }
         if let text = (content["outputTranscription"] as? [String: Any])?["text"] as? String { events.append(.reply(text)) }
         for part in (content["modelTurn"] as? [String: Any])?["parts"] as? [[String: Any]] ?? [] {
             guard let blob = part["inlineData"] as? [String: Any], let mime = blob["mimeType"] as? String, mime.hasPrefix("audio/pcm"),
@@ -168,7 +172,6 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
         tools = declarations.map { declaration in
             ["type": "function", "name": declaration["name"] ?? "", "description": declaration["description"] ?? "", "parameters": Self.jsonSchema(declaration["parameters"] ?? [:])]
         }
-        if !testOnly { tools.insert(Self.driveTool, at: 0) }
         return ["type": "session.update", "session": sessionPayload()]
     }
     func updateVideo(_ enabled: Bool) -> [[String: Any]] {
@@ -186,21 +189,6 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
         }
         return result
     }
-    private static let driveTool: [String: Any] = [
-        "type": "function", "name": "drive",
-        "description": "Move the car the moment the user clearly asks to go forward, back up, turn left, or turn right. Call this instead of only agreeing in speech.",
-        "parameters": [
-            "type": "object",
-            "properties": [
-                "direction": [
-                    "type": "string",
-                    "enum": ["前进", "后退", "左转", "右转"],
-                    "description": "前进 moves closer, 后退 backs up, 左转 turns left, 右转 turns right."
-                ]
-            ],
-            "required": ["direction"]
-        ]
-    ]
     private func sessionPayload() -> [String: Any] {
         let video = acceptsVideo && !testOnly
         return [
@@ -222,18 +210,8 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
             text = text.replacingOccurrences(of: "(?s)<perception_truth>.*?</perception_truth>\\n?", with: "", options: .regularExpression)
             text = text.replacingOccurrences(of: "(?s)<body_context_rules>.*?</body_context_rules>\\n?", with: "", options: .regularExpression)
         }
-        text = text.replacingOccurrences(of: "You have one tool: run_scenario.", with: "Use drive for 前进, 后退, 左转, and 右转. Use run_scenario for every other approved scenario.")
         let camera = video ? "The camera is on. Describe only what a new frame shows." : "The camera is off. Do not claim you can see the user, the room, or any object."
-        text += """
-
-        <car_motion>
-        This device is a small car. When the user clearly asks to move, call drive immediately. direction must be exactly 前进, 后退, 左转, or 右转.
-        前进, 向前, 往前, and 向前走 use 前进. 后退, 向后, 往后, and 向后走 use 后退. 左转, 向左, and 往左 use 左转. 右转, 向右, and 往右 use 右转.
-        Do not answer these four commands with speech alone. Prefer the tool call and no extra speech.
-        \(camera) Do not search the web.
-        </car_motion>
-        """
-        return text
+        return text + "\n\n" + camera + " Do not search the web."
     }
     func encode(_ command: KariLiveCommand) -> [[String: Any]] {
         switch command {
@@ -264,11 +242,11 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
         case "error": throw KariError.message((message["error"] as? [String: Any])?["message"] as? String ?? "AI 拒绝请求")
         case "session.updated": return [.ready]
         case "input_audio_buffer.speech_started": return [.interrupted]
-        case "conversation.item.input_audio_transcription.completed": return (message["transcript"] as? String).map { [.heard($0)] } ?? []
+        case "conversation.item.input_audio_transcription.completed": return (message["transcript"] as? String).map { [.heard($0, final: true)] } ?? []
         case "conversation.item.created":
             guard ((message["item"] as? [String: Any])?["role"] as? String) == "user" else { return [] }
             let parts = (message["item"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
-            return parts.compactMap { part in (part["transcript"] as? String).flatMap { $0.isEmpty ? nil : $0 } }.map { .heard($0) }
+            return parts.compactMap { part in (part["transcript"] as? String).flatMap { $0.isEmpty ? nil : $0 } }.map { .heard($0, final: true) }
         case "response.audio_transcript.delta": return (message["delta"] as? String).map { [.reply($0)] } ?? []
         case "response.audio.delta": return (message["delta"] as? String).flatMap { Data(base64Encoded: $0) }.map { [.audio($0)] } ?? []
         case "response.audio.done": return [.generationComplete]
