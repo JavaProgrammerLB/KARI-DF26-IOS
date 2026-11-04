@@ -37,6 +37,7 @@ __pycache__/
 *.egg-info/
 test-results/
 playwright-report/
+.gradle/
 
 .cache/
 
