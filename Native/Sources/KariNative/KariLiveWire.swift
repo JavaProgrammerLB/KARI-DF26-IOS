@@ -230,7 +230,7 @@ fileprivate final class ZhipuLiveWire: KariLiveWire {
         This device is a small car. When the user clearly asks to move, call drive immediately. direction must be exactly 前进, 后退, 左转, or 右转.
         前进, 向前, 往前, and 向前走 use 前进. 后退, 向后, 往后, and 向后走 use 后退. 左转, 向左, and 往左 use 左转. 右转, 向右, and 往右 use 右转.
         Do not answer these four commands with speech alone. Prefer the tool call and no extra speech.
-        \(camera) Do not search the web.
+        \(camera) If you are unsure, say so directly. Do not pretend to search.
         </car_motion>
         """
         return text

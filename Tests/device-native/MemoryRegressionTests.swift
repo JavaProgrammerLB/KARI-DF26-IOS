@@ -148,6 +148,9 @@ final class MemoryRegressionTests: XCTestCase {
         XCTAssertEqual(KariMemoryActionPolicy.resolveToolScenario("come_closer"), "come_closer")
         XCTAssertEqual(KariMemoryActionPolicy.resolveToolScenario("look_right"), "look_right")
         XCTAssertNil(KariMemoryActionPolicy.resolveToolScenario("前进是什么意思？"))
+        XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "往前进"), "come_closer")
+        XCTAssertEqual(KariMemoryActionPolicy.resolveToolScenario("后退10次"), "back_up")
+        XCTAssertEqual(KariMemoryActionPolicy.requestedRepeats("后退10次"), 10)
     }
 
 }
