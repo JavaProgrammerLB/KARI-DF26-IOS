@@ -121,10 +121,17 @@ import GoogleSignIn
     init() { audio.activate = { try Self.activateAudio() } }
     private static func activateAudio() throws {
         let session = AVAudioSession.sharedInstance()
-        // Record from the iPhone microphone, the same input Voice Memos uses.
-        // voiceChat plus a headset microphone was holding the captured voice down.
+        // Headset stays on the default mode. voiceChat there held the captured voice down.
+        // The built-in speaker uses voiceChat so the voice processor can cancel playback from the uplink.
         try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothA2DP])
         try session.setActive(true)
+        if KariAudioOutput.usesBuiltInSpeaker() {
+            try? session.setPreferredSampleRate(48_000)
+            try? session.setPreferredIOBufferDuration(0.02)
+            if (try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])) != nil {
+                try? session.setActive(true)
+            }
+        }
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             try session.setPreferredInput(builtIn)
         }
@@ -208,7 +215,7 @@ import GoogleSignIn
         try audio.startMicrophone(onFrame: { [weak self] data, level in
             guard let self else { return }
             self.inputLevel = level
-            if self.inputDescription.isEmpty { self.inputDescription = self.audio.inputDescription }
+            if self.inputDescription != self.audio.inputDescription { self.inputDescription = self.audio.inputDescription }
             if self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
             let now = ProcessInfo.processInfo.systemUptime
             switch LiveMicGate.disposition(speaking: self.speaking, responseOpen: self.responseOpen, now: now, echoUntil: self.echoUntil) {

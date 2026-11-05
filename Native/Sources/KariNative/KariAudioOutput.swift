@@ -17,12 +17,15 @@ final class KariAudioOutput {
     private var playedChunks = 0
     private var configurationObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
+    private var routeObserver: NSObjectProtocol?
     private var microphoneTapStarts = 0
     private var capturedPCMFrames = 0
     private var microphoneTapInstalled = false
     private var microphoneWanted = false
     private var microphoneGeneration = 0
     private var voiceProcessingEnabled = false
+    private var voiceProcessingWanted = false
+    private var voiceProcessingNote = ""
     private var interrupted = false
     private var configuringSession = false
     private var reconfiguring = false
@@ -43,6 +46,13 @@ final class KariAudioOutput {
             guard let self, !self.reconfiguring, !self.engine.isRunning else { return }
             if !self.playbackQueue.isEmpty && !self.interrupted { self.recoverPlayback() }
             if self.microphoneWanted && !self.interrupted { self.recoverMicrophone() }
+        }
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] _ in
+            guard let self, self.microphoneWanted, !self.reconfiguring, !self.configuringSession, !self.interrupted else { return }
+            guard Self.usesBuiltInSpeaker() != self.voiceProcessingWanted else { return }
+            self.recoverMicrophone()
         }
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
@@ -71,6 +81,7 @@ final class KariAudioOutput {
         playbackTimer?.invalidate(); startup?.cancel()
         if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
         if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
     }
 
     func prepare() throws -> [String: Any] {
@@ -104,19 +115,14 @@ final class KariAudioOutput {
         do {
             try activate?()
             let input = engine.inputNode
-            if engine.isRunning { engine.stop() }
-            // The hardware format is only real after the engine has run once. Read it, stop,
-            // then install the tap while stopped and start again.
-            engine.prepare(); try engine.start()
-            let sourceFormat = input.outputFormat(forBus: 0)
-            engine.stop()
-            guard sourceFormat.sampleRate > 0, sourceFormat.channelCount > 0 else {
-                throw failure("麦克风格式不可用，请检查音频设备后恢复采集")
-            }
-            let route = AVAudioSession.sharedInstance().currentRoute.inputs.map(\.portName).joined(separator: "、")
-            inputDescription = "\(Int(sourceFormat.sampleRate))Hz \(route)"
+            let sourceFormat = try prepareInputForCapture()
+            let session = AVAudioSession.sharedInstance()
+            let route = session.currentRoute.inputs.map(\.portName).joined(separator: "、")
+            let outputs = session.currentRoute.outputs.map(\.portName).joined(separator: "、")
+            let processing = voiceProcessingEnabled ? "语音处理开" : "语音处理关"
+            inputDescription = "\(Int(sourceFormat.sampleRate))Hz \(route)→\(outputs) \(processing)"
+            if !voiceProcessingNote.isEmpty { inputDescription += " \(voiceProcessingNote)" }
             let generation = microphoneGeneration
-            microphoneTapStarts += 1
             input.installTap(onBus: 0, bufferSize: 2048, format: sourceFormat) { [weak self] buffer, _ in
                 guard let self, let data = Self.pcm16k(buffer) else { return }
                 let count = data.count / 2
@@ -133,7 +139,47 @@ final class KariAudioOutput {
                 }
             }
             microphoneTapInstalled = true
-            engine.prepare(); try engine.start()
+            microphoneTapStarts += 1
+            engine.prepare()
+            do { try engine.start() }
+            catch {
+                guard voiceProcessingEnabled else { throw error }
+                removeMicrophoneTap()
+                try? input.setVoiceProcessingEnabled(false)
+                voiceProcessingEnabled = false
+                voiceProcessingNote = "语音处理未开"
+                engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
+                engine.prepare()
+                try engine.start()
+                let fallbackFormat = input.outputFormat(forBus: 0)
+                engine.stop()
+                let tapFormat = fallbackFormat.sampleRate > 0 ? fallbackFormat : sourceFormat
+                inputDescription = "\(Int(tapFormat.sampleRate))Hz \(route)→\(outputs) 语音处理关 \(voiceProcessingNote)"
+                let fallbackGeneration = microphoneGeneration
+                input.installTap(onBus: 0, bufferSize: 2048, format: tapFormat) { [weak self] buffer, _ in
+                    guard let self, let data = Self.pcm16k(buffer) else { return }
+                    let count = data.count / 2
+                    var sum: Double = 0
+                    data.withUnsafeBytes { raw in
+                        let samples = raw.bindMemory(to: Int16.self)
+                        for index in 0..<count { let value = Double(samples[index]) / 32768; sum += value * value }
+                    }
+                    let level = sqrt(sum / Double(max(count, 1)))
+                    DispatchQueue.main.async {
+                        guard self.microphoneWanted, self.microphoneGeneration == fallbackGeneration else { return }
+                        self.capturedPCMFrames += count
+                        self.microphoneFrame?(data, level)
+                    }
+                }
+                microphoneTapInstalled = true
+                microphoneTapStarts += 1
+                engine.prepare()
+                try engine.start()
+            }
+            if voiceProcessingEnabled {
+                input.isVoiceProcessingAGCEnabled = false
+                input.isVoiceProcessingBypassed = false
+            }
             DispatchQueue.main.async { [weak self] in self?.configuringSession = false }
             onState("started", "")
         } catch {
@@ -141,6 +187,83 @@ final class KariAudioOutput {
             removeMicrophoneTap(); microphoneWanted = false
             throw error
         }
+    }
+
+    /// Built-in speaker and receiver need echo cancellation. A headset already isolates playback.
+    static func usesBuiltInSpeaker() -> Bool {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        guard !outputs.isEmpty else { return true }
+        return outputs.allSatisfy { $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver }
+    }
+
+    /// Enable the voice processor while the engine is stopped. Playback through this engine is the reference.
+    private func configureSpeakerEchoCancellation() {
+        let input = engine.inputNode
+        let speaker = Self.usesBuiltInSpeaker()
+        voiceProcessingWanted = speaker
+        voiceProcessingNote = ""
+        if input.isVoiceProcessingEnabled == speaker {
+            voiceProcessingEnabled = input.isVoiceProcessingEnabled
+            if voiceProcessingEnabled {
+                input.isVoiceProcessingAGCEnabled = false
+                input.isVoiceProcessingBypassed = false
+            }
+            return
+        }
+        do {
+            try input.setVoiceProcessingEnabled(speaker)
+            voiceProcessingEnabled = input.isVoiceProcessingEnabled
+            if voiceProcessingEnabled {
+                input.isVoiceProcessingAGCEnabled = false
+                input.isVoiceProcessingBypassed = false
+            }
+        } catch {
+            voiceProcessingEnabled = input.isVoiceProcessingEnabled
+            if speaker { voiceProcessingNote = "语音处理未开" }
+        }
+    }
+
+    /// The hardware format is only real after the engine has run once. Leave the engine stopped for the tap.
+    private func prepareInputForCapture() throws -> AVAudioFormat {
+        let input = engine.inputNode
+        if engine.isRunning { engine.stop() }
+        // Match the output format before enabling the voice processor, or the engine refuses to start.
+        if Self.usesBuiltInSpeaker(), !input.isVoiceProcessingEnabled {
+            let hardware = try realizeInputFormat()
+            if hardware.sampleRate > 0 { engine.connect(engine.mainMixerNode, to: engine.outputNode, format: hardware) }
+        }
+        configureSpeakerEchoCancellation()
+        var format = try realizeInputFormat()
+        if voiceProcessingEnabled, format.sampleRate > 0 {
+            let outputFormat = engine.outputNode.inputFormat(forBus: 0)
+            if outputFormat.sampleRate != format.sampleRate || outputFormat.channelCount != format.channelCount {
+                engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
+                format = try realizeInputFormat()
+            }
+            input.isVoiceProcessingAGCEnabled = false
+            input.isVoiceProcessingBypassed = false
+        }
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw failure("麦克风格式不可用，请检查音频设备后恢复采集")
+        }
+        return format
+    }
+
+    private func realizeInputFormat() throws -> AVAudioFormat {
+        engine.prepare()
+        do { try engine.start() }
+        catch {
+            guard voiceProcessingEnabled else { throw error }
+            try? engine.inputNode.setVoiceProcessingEnabled(false)
+            voiceProcessingEnabled = false
+            voiceProcessingNote = "语音处理未开"
+            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
+            engine.prepare()
+            try engine.start()
+        }
+        let format = engine.inputNode.outputFormat(forBus: 0)
+        engine.stop()
+        return format
     }
 
     /// Downsample the microphone buffer to little-endian 16 kHz mono PCM.
@@ -205,7 +328,8 @@ final class KariAudioOutput {
                 "queuedChunks": pending.count, "playedChunks": playedChunks,
                 "bufferedSeconds": Double(playbackQueue.queuedFrames) / format.sampleRate,
                 "scheduledSeconds": Double(playbackQueue.scheduledFrames) / format.sampleRate,
-                "playerRunning": player.isPlaying, "playbackRecoveries": recoveryAttempts]
+                "playerRunning": player.isPlaying, "playbackRecoveries": recoveryAttempts,
+                "voiceProcessing": voiceProcessingEnabled, "audioMode": session.mode.rawValue]
     }
 
     func enqueue(data: Data, sampleRate: Double, completion: @escaping (Result<[String: Any], Error>) -> Void) throws {
@@ -336,6 +460,7 @@ final class KariAudioOutput {
         if voiceProcessingEnabled {
             try? engine.inputNode.setVoiceProcessingEnabled(false)
             voiceProcessingEnabled = false
+            voiceProcessingWanted = false
         }
     }
 
