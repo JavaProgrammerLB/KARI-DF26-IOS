@@ -121,10 +121,17 @@ import GoogleSignIn
     init() { audio.activate = { try Self.activateAudio() } }
     private static func activateAudio() throws {
         let session = AVAudioSession.sharedInstance()
-        // Record from the iPhone microphone, the same input Voice Memos uses.
-        // voiceChat plus a headset microphone was holding the captured voice down.
+        // Headset stays on the default mode. voiceChat there held the captured voice down.
+        // The built-in speaker uses voiceChat so the voice processor can cancel playback from the uplink.
         try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothA2DP])
         try session.setActive(true)
+        if KariAudioOutput.usesBuiltInSpeaker() {
+            try? session.setPreferredSampleRate(48_000)
+            try? session.setPreferredIOBufferDuration(0.02)
+            if (try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])) != nil {
+                try? session.setActive(true)
+            }
+        }
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             try session.setPreferredInput(builtIn)
         }
@@ -159,7 +166,7 @@ import GoogleSignIn
                             if Self.recoverableLiveError(text) {
                                 self.serverNote = "上一轮被打断，可以继续说"
                                 self.responseOpen = false
-                                self.echoUntil = ProcessInfo.processInfo.systemUptime + 0.45
+                                self.echoUntil = ProcessInfo.processInfo.systemUptime + 0.8
                                 KariLiveTrace.line("note \(text.prefix(180))")
                                 continue
                             }
@@ -208,7 +215,7 @@ import GoogleSignIn
         try audio.startMicrophone(onFrame: { [weak self] data, level in
             guard let self else { return }
             self.inputLevel = level
-            if self.inputDescription.isEmpty { self.inputDescription = self.audio.inputDescription }
+            if self.inputDescription != self.audio.inputDescription { self.inputDescription = self.audio.inputDescription }
             if self.speaking { self.peakMicrophoneDuringPlayback = max(self.peakMicrophoneDuringPlayback, level); self.microphoneFramesDuringPlayback += 1 }
             let now = ProcessInfo.processInfo.systemUptime
             switch LiveMicGate.disposition(speaking: self.speaking, responseOpen: self.responseOpen, now: now, echoUntil: self.echoUntil) {
@@ -349,7 +356,7 @@ import GoogleSignIn
         case .turnComplete:
             awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
             responseOpen = false
-            echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.45)
+            echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.8)
         case .toolCalls(let calls): runTools(calls, token: token)
         case .toolCancellation(let ids):
             cancelledToolIDs.formUnion(ids)
