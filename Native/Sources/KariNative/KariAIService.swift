@@ -382,10 +382,14 @@ import GoogleSignIn
                         response["results"] = try await search(query)
                     } else if call.name == "run_scenario" || call.name == "drive" {
                         let raw = (call.name == "drive" ? args["direction"] : args["name"]) as? String ?? ""
-                        guard let name = KariMemoryActionPolicy.resolveToolScenario(raw), let run = self.onScenario else { throw KariError.message("未知动作请求") }
+                        guard let name = KariMemoryActionPolicy.resolveToolScenario(raw), let run = self.onScenario else { throw KariError.message("不支持的说法，请说前进或后退") }
                         guard !self.memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(self.userUtterance) else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
-                        if self.claimMotion(name) { try await run(name) }
-                    } else { throw KariError.message("未知动作请求") }
+                        if self.claimMotion(name) {
+                            try await run(name)
+                            let repeats = max(KariMemoryActionPolicy.requestedRepeats(raw), KariMemoryActionPolicy.requestedRepeats(self.userUtterance))
+                            if repeats > 1 { response["reason"] = "已执行一次，共请求 \(repeats) 次" }
+                        }
+                    } else { throw KariError.message("不支持的说法，请说前进或后退") }
                 } catch { response = ["ok": false, "reason": error.localizedDescription] }
                 self.memoryToolIDs.remove(call.id)
                 if !self.cancelledToolIDs.contains(call.id) { results.append(.init(id: call.id, name: call.name, response: response)) }
