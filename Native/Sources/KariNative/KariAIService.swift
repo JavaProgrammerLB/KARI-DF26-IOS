@@ -159,7 +159,7 @@ import GoogleSignIn
                             if Self.recoverableLiveError(text) {
                                 self.serverNote = "上一轮被打断，可以继续说"
                                 self.responseOpen = false
-                                self.echoUntil = ProcessInfo.processInfo.systemUptime + 0.45
+                                self.echoUntil = ProcessInfo.processInfo.systemUptime + 0.8
                                 KariLiveTrace.line("note \(text.prefix(180))")
                                 continue
                             }
@@ -349,7 +349,7 @@ import GoogleSignIn
         case .turnComplete:
             awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
             responseOpen = false
-            echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.45)
+            echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.8)
         case .toolCalls(let calls): runTools(calls, token: token)
         case .toolCancellation(let ids):
             cancelledToolIDs.formUnion(ids)
