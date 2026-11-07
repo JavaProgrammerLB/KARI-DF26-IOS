@@ -79,6 +79,13 @@ struct KariNativeSettingsPage: View {
     var body: some View {
         NavigationView {
             Form {
+                if app.turnCalibrating {
+                    Section(header: Text(L("标定转一圈"))) {
+                        Text(L("已完成 %d 次右转", app.turnCalibrationPulses))
+                        Button(L("完成")) { app.finishTurnCalibration() }
+                        Button(L("取消标定")) { app.cancelTurnCalibration() }
+                    }
+                }
                 Section(header: Text(L("连接与对话"))) {
                     Button(action: robots) { Label(L("连接机器人"), systemImage: "antenna.radiowaves.left.and.right") }
                     Button(action: ai) { Label(L("AI 服务"), systemImage: "waveform") }

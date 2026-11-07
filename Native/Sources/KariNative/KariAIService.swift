@@ -54,6 +54,8 @@ import GoogleSignIn
     var onMemoryCancel: (() -> Void)?
     var onAction: ((KariAction) async throws -> MotionExecutionReport)?
     var onVoiceMotionBlocked: (() -> Void)?
+    var turnCalibration: (() -> TurnPulseCalibration?)?
+    var onChassisNotice: ((String) -> Void)?
     var onCancel: (() -> Void)?
     var onImmediateStop: (() -> Void)?
     private let audio = KariAudioOutput()
@@ -361,8 +363,8 @@ import GoogleSignIn
             if acceptTranscript(text, final: final), userUtterance.count < 2000 { userUtterance += text }
             heard = String((heard + text).suffix(1500))
             if KariAIRequest.isStopRequest(text) { onImmediateStop?() }
-            else if final, mayMove, let result = MotionPlan.parse(utterance: text), case .success(let plan) = result {
-                if admit(plan, trigger: .transcript) == .run { settledTurn = userTurn; start(plan) }
+            else if final, mayMove, let resolution = ChassisIntent.resolve(utterance: text, calibration: turnCalibration?()) {
+                noteResolved(resolution, trigger: .transcript)
             } else if final, !speaking, ProcessInfo.processInfo.systemUptime >= echoUntil, turnArmed || turnTyped,
                       let name = KariMemoryActionPolicy.scenario(for: text), MotionPlan.parse(utterance: text) == nil,
                       claimMotion(name), let run = onAction {
@@ -417,26 +419,11 @@ import GoogleSignIn
                     } else if call.name == MotionPlan.toolName || call.name == "run_scenario" {
                         guard self.mayMove else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
                         guard let run = self.onAction else { throw KariError.message("未知动作请求") }
-                        if call.name == MotionPlan.toolName {
-                            let plan = try MotionPlan.parse(wire: args).get()
-                            switch self.admit(plan, trigger: .tool) {
-                            case .run:
-                                let report = try await run(.plan(plan))
-                                let reply = MotionToolReply.make(decision: .allow, report: report)
-                                response["ok"] = reply.ok
-                                response["executed"] = reply.executed ?? 0
-                                response["requested"] = reply.requested ?? plan.pulseCount
-                                if let reason = reply.reason { response["reason"] = reason }
-                            case .duplicate:
-                                if let reason = MotionToolReply.make(decision: .suppressDuplicate, report: nil).reason { response["reason"] = reason }
-                            case .conflict:
-                                throw KariError.message("这一句已经在执行另一组动作，小车不会再加动作")
-                            case .refused(let decision):
-                                let reply = MotionToolReply.make(decision: decision, report: nil)
-                                response["ok"] = reply.ok
-                                if let executed = reply.executed { response["executed"] = executed }
-                                if let reason = reply.reason { response["reason"] = reason }
-                            }
+                        let calibration = self.turnCalibration?()
+                        if ChassisIntent.isCircleUtterance(self.userUtterance), let spoken = ChassisIntent.resolve(utterance: self.userUtterance, calibration: calibration) {
+                            response = try await self.fulfill(spoken, trigger: .tool, run: run)
+                        } else if call.name == MotionPlan.toolName {
+                            response = try await self.fulfill(ChassisIntent.resolve(wire: args, calibration: calibration), trigger: .tool, run: run)
                         } else if let name = KariMemoryActionPolicy.resolveToolScenario(args["name"] as? String ?? "") {
                             let echoRisk = self.speaking || ProcessInfo.processInfo.systemUptime < self.echoUntil
                             if !self.voiceTrusted { throw KariError.message("扬声器语音处理未开，已拒绝语音动作") }
@@ -517,11 +504,13 @@ import GoogleSignIn
         return !speaking && ProcessInfo.processInfo.systemUptime >= echoUntil
     }
     private enum PlanAdmission: Equatable { case run, duplicate, conflict, refused(MotionStartDecision) }
+    private func startRequest(_ trigger: MotionTrigger, plan: MotionPlan?) -> MotionStartRequest {
+        .init(trigger: trigger, speaking: speaking, echoTail: ProcessInfo.processInfo.systemUptime < echoUntil,
+              voiceTrusted: voiceTrusted, turnArmed: turnArmed || turnTyped,
+              duplicateWithoutFreshUplink: plan.map { lastVoicePlan == $0 && !freshUplinkSincePlan } ?? false)
+    }
     private func admit(_ plan: MotionPlan, trigger: MotionTrigger) -> PlanAdmission {
-        let decision = MotionStartGate.decide(.init(
-            trigger: trigger, speaking: speaking, echoTail: ProcessInfo.processInfo.systemUptime < echoUntil,
-            voiceTrusted: voiceTrusted, turnArmed: turnArmed || turnTyped,
-            duplicateWithoutFreshUplink: lastVoicePlan == plan && !freshUplinkSincePlan))
+        let decision = MotionStartGate.decide(startRequest(trigger, plan: plan))
         guard decision == .allow else {
             if decision == .rejectUntrustedVoice { onVoiceMotionBlocked?() }
             return .refused(decision)
@@ -546,12 +535,70 @@ import GoogleSignIn
         guard let run = onAction else { return }
         Task { try? await run(.plan(plan)) }
     }
+    /// Circle phrases expand locally. A guessed `steps` count is not driven for that utterance.
+    private func noteResolved(_ resolution: ChassisIntentResult, trigger: MotionTrigger) {
+        switch resolution {
+        case .plan(let plan):
+            if admit(plan, trigger: trigger) == .run {
+                if trigger != .settle { settledTurn = userTurn }
+                start(plan)
+            }
+        case .needsCalibration, .refused:
+            switch MotionStartGate.decide(startRequest(trigger, plan: nil)) {
+            case .allow:
+                if trigger != .settle { settledTurn = userTurn }
+                onChassisNotice?(resolution.userReason)
+            case .rejectUntrustedVoice:
+                if trigger != .settle { settledTurn = userTurn }
+                onVoiceMotionBlocked?()
+            case .rejectEcho, .suppressDuplicate:
+                break
+            }
+        }
+    }
+    private func fulfill(_ resolution: ChassisIntentResult, trigger: MotionTrigger, run: (KariAction) async throws -> MotionExecutionReport) async throws -> [String: Any] {
+        switch resolution {
+        case .plan(let plan):
+            switch admit(plan, trigger: trigger) {
+            case .run:
+                let report = try await run(.plan(plan))
+                let reply = MotionToolReply.make(decision: .allow, report: report)
+                var response: [String: Any] = ["ok": reply.ok, "executed": reply.executed ?? 0, "requested": reply.requested ?? plan.pulseCount]
+                if let reason = reply.reason { response["reason"] = reason }
+                return response
+            case .duplicate:
+                var response: [String: Any] = ["ok": true]
+                if let reason = MotionToolReply.make(decision: .suppressDuplicate, report: nil).reason { response["reason"] = reason }
+                return response
+            case .conflict:
+                throw KariError.message("这一句已经在执行另一组动作，小车不会再加动作")
+            case .refused(let decision):
+                let reply = MotionToolReply.make(decision: decision, report: nil)
+                var response: [String: Any] = ["ok": reply.ok]
+                if let executed = reply.executed { response["executed"] = executed }
+                if let reason = reply.reason { response["reason"] = reason }
+                return response
+            }
+        case .needsCalibration, .refused:
+            let decision = MotionStartGate.decide(startRequest(trigger, plan: nil))
+            if decision != .allow {
+                if decision == .rejectUntrustedVoice { onVoiceMotionBlocked?() }
+                let reply = MotionToolReply.make(decision: decision, report: nil)
+                var response: [String: Any] = ["ok": reply.ok]
+                if let executed = reply.executed { response["executed"] = executed }
+                if let reason = reply.reason { response["reason"] = reason }
+                return response
+            }
+            onChassisNotice?(resolution.userReason)
+            return ["ok": false, "executed": 0, "reason": resolution.userReason]
+        }
+    }
     private func settleTurn() {
         let turn = userTurn, utterance = userUtterance
         guard settledTurn != turn, claimedPlan?.turn != turn, !utterance.isEmpty, mayMove else { return }
         settledTurn = turn
-        guard let result = MotionPlan.parse(utterance: utterance), case .success(let plan) = result else { return }
-        if admit(plan, trigger: .settle) == .run { start(plan) }
+        guard let resolution = ChassisIntent.resolve(utterance: utterance, calibration: turnCalibration?()) else { return }
+        noteResolved(resolution, trigger: .settle)
     }
     /// Tool calls and the transcript can both name the same move. A second copy inside this window is the echo, not a new command.
     private func claimMotion(_ name: String) -> Bool {

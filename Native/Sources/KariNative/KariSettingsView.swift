@@ -62,6 +62,27 @@ struct KariSettingsView: View {
                     Text(LM(app.notice)).font(.footnote).foregroundStyle(.secondary)
                     if !app.textReply.isEmpty { Text(app.textReply).font(.subheadline).lineLimit(4) }
                 }
+                Section(header: Text(L("标定转一圈")), footer: Text(L("小车会连续右转。你看到它转完一圈后点完成，手机会记住需要多少次。"))) {
+                    if let calibration = settings.turnCalibration {
+                        Text(L("当前标定：%d 次右转为一圈", calibration.samplePulses)).font(.footnote).foregroundStyle(.secondary)
+                        if calibration.samplePulses > SpinExpander.maxSteps * SpinExpander.pulsesPerStep {
+                            Text(L("这次标定要 %d 次右转，一次最多 160 次，说「转一圈」时小车不会动。", calibration.samplePulses)).font(.footnote).foregroundStyle(.secondary)
+                        }
+                        Button(L("清除标定"), role: .destructive) {
+                            settings.clearTurnCalibration()
+                            message = "已清除转一圈标定"
+                        }.disabled(app.turnCalibrating)
+                    } else {
+                        Text(L("还没标定。说「转一圈」之前需要先标定。")).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if app.turnCalibrating {
+                        Text(L("已完成 %d 次右转", app.turnCalibrationPulses))
+                        Button(L("完成")) { app.finishTurnCalibration() }
+                        Button(L("取消标定")) { app.cancelTurnCalibration() }
+                    } else {
+                        Button(L("标定转一圈")) { app.beginTurnCalibration() }
+                    }
+                }
                 Section(header: Text(L("应用与权限"))) {
                     Button(L("打开系统权限设置")) { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
                     Text(L("SwiftUI 原生界面 · 原生音视频 · 原生蓝牙")).font(.caption).foregroundStyle(.secondary)

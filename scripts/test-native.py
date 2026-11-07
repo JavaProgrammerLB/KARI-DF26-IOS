@@ -8,7 +8,7 @@ import plistlib
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-sources = ['KariDeviceReadiness', 'KariFirmwareCache', 'KariSettings', 'KariBodyProtocol', 'KariAIRequest', 'KariPlaybackQueue', 'KariLiveConfiguration', 'KariMotionPlan', 'KariLiveWire', 'KariLiveMicGate', 'KariLocalization', 'KariConversationLanguage']
+sources = ['KariDeviceReadiness', 'KariFirmwareCache', 'KariTurnPulseCalibration', 'KariSettings', 'KariBodyProtocol', 'KariAIRequest', 'KariPlaybackQueue', 'KariLiveConfiguration', 'KariMotionPlan', 'KariLiveWire', 'KariLiveMicGate', 'KariLocalization', 'KariConversationLanguage']
 with tempfile.TemporaryDirectory(prefix='kari-native-tests-') as folder:
     output = Path(folder) / 'native-checks'
     subprocess.run(['xcrun', 'swiftc', '-module-cache-path', str(Path(folder) / 'cache'),
@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='kari-native-tests-') as folder:
 
     remote_output = Path(folder) / 'remote-checks'
     subprocess.run(['xcrun', 'swiftc', '-parse-as-library', '-module-cache-path', str(Path(folder) / 'cache'),
-                    *[str(root / 'Native/Sources/KariNative' / (name + '.swift')) for name in ['KariSettings', 'KariBodyProtocol', 'KariRemoteControl']],
+                    *[str(root / 'Native/Sources/KariNative' / (name + '.swift')) for name in ['KariTurnPulseCalibration', 'KariSettings', 'KariBodyProtocol', 'KariRemoteControl']],
                     str(root / 'Tests/remote/RemoteTests.swift'), '-o', str(remote_output)], check=True)
     subprocess.run([str(remote_output)], check=True)
 

@@ -135,11 +135,13 @@ enum KariKeychain {
 
 final class KariSettings: ObservableObject {
     @Published private(set) var configuration = KariAIConfiguration()
+    @Published private(set) var turnCalibration: TurnPulseCalibration?
     @Published var motionEnabled = true
     private var profiles: [String: KariAIConfiguration] = [:]
     private let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        turnCalibration = TurnPulseCalibration.load(from: defaults)
         Self.migrateStoredScenes(defaults)
         if let data = defaults.data(forKey: "kari.native.profiles.v2"), let saved = try? JSONDecoder().decode([String: KariAIConfiguration].self, from: data) {
             profiles = saved; configuration = saved[defaults.string(forKey: "kari.native.selected.v2") ?? "gemini"] ?? configuration
@@ -174,5 +176,13 @@ final class KariSettings: ObservableObject {
         defaults.set(try JSONEncoder().encode(updated), forKey: "kari.native.profiles.v2")
         defaults.set(config.provider, forKey: "kari.native.selected.v2")
         profiles = updated; configuration = config
+    }
+    func saveTurnCalibration(_ value: TurnPulseCalibration) {
+        TurnPulseCalibration.store(value, in: defaults)
+        turnCalibration = value
+    }
+    func clearTurnCalibration() {
+        TurnPulseCalibration.store(nil, in: defaults)
+        turnCalibration = nil
     }
 }
