@@ -516,7 +516,7 @@ import GoogleSignIn
         _ = (text, final)
         return !speaking && ProcessInfo.processInfo.systemUptime >= echoUntil
     }
-    private enum PlanAdmission { case run, duplicate, conflict, refused(MotionStartDecision) }
+    private enum PlanAdmission: Equatable { case run, duplicate, conflict, refused(MotionStartDecision) }
     private func admit(_ plan: MotionPlan, trigger: MotionTrigger) -> PlanAdmission {
         let decision = MotionStartGate.decide(.init(
             trigger: trigger, speaking: speaking, echoTail: ProcessInfo.processInfo.systemUptime < echoUntil,
