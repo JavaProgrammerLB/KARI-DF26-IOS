@@ -196,6 +196,10 @@ final class KariAudioOutput {
         return outputs.allSatisfy { $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver }
     }
 
+    /// Voice motion is trusted on a headset, or on the built-in speaker only while voice processing actually enabled.
+    /// A failed processor leaves this false so a plan cannot start on an uncancelled speaker path.
+    var voiceMotionTrusted: Bool { !Self.usesBuiltInSpeaker() || voiceProcessingEnabled }
+
     /// Enable the voice processor while the engine is stopped. Playback through this engine is the reference.
     private func configureSpeakerEchoCancellation() {
         let input = engine.inputNode

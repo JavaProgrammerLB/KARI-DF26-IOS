@@ -153,13 +153,14 @@ let liveTemplate: [String: Any] = ["model": "placeholder", "generationConfig": [
 let liveContext = KariLiveSessionContext(personality: "warm persona", memoryInstruction: "MEMORY POLICY", resumeHandle: "resume-1")
 var goldenSetup = KariLiveConfiguration.setup(liveTemplate, model: "models/gemini-3.8-live", testOnly: false)
 var goldenParts = (goldenSetup["systemInstruction"] as! [String: Any])["parts"] as! [[String: Any]]
+goldenParts.append(["text": MotionPlan.modelInstruction])
 goldenParts.append(["text": "warm persona"])
 goldenParts.append(["text": "MEMORY POLICY Use search_memory with a self-contained query before answering document or personal-memory questions. State only references returned by that tool. Never read UUID citation IDs aloud; mention document names and locations instead."])
-goldenSetup["tools"] = (goldenSetup["tools"] as! [[String: Any]]) + [["functionDeclarations": [["name": "search_memory", "description": "Search the user's imported memory documents; no physical actions.", "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "A self-contained search question"]], "required": ["query"]]]]]]
+goldenSetup["tools"] = [["functionDeclarations": [MotionPlan.toolDeclaration]]] + (goldenSetup["tools"] as! [[String: Any]]) + [["functionDeclarations": [["name": "search_memory", "description": "Search the user's imported memory documents; no physical actions.", "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "A self-contained search question"]], "required": ["query"]]]]]]
 goldenSetup["systemInstruction"] = ["parts": goldenParts]
 goldenSetup["sessionResumption"] = ["handle": "resume-1"]
 let geminiWire = try KariAIConfiguration.fresh("gemini").liveWire()
-check(try canonicalJSON(geminiWire.setupMessage(template: liveTemplate, context: liveContext)) == canonicalJSON(["setup": goldenSetup]), "Gemini Live setup message is unchanged")
+check(try canonicalJSON(geminiWire.setupMessage(template: liveTemplate, context: liveContext)) == canonicalJSON(["setup": goldenSetup]), "Gemini Live setup carries one counted drive plan")
 let geminiConnect = geminiWire.connectRequest(credential: "gemini-key")
 check(geminiConnect.url?.host == "generativelanguage.googleapis.com" && geminiConnect.value(forHTTPHeaderField: "x-goog-api-key") == "gemini-key", "Gemini Live dials Google with the API key header")
 check(try canonicalJSON(geminiWire.encode(.audio(Data([1, 2])))) == canonicalJSON([["realtimeInput": ["audio": ["data": "AQI=", "mimeType": "audio/pcm;rate=16000"]]]]), "Gemini Live audio frame is unchanged")
@@ -178,7 +179,8 @@ check(zhipuBeta?["chat_mode"] as? String == "audio" && zhipuBeta?["auto_search"]
 check((zhipuSession["temperature"] as? Double) == 0.2 && (zhipuSession["turn_detection"] as? [String: Any])?["silence_duration_ms"] as? Int == 700 && (zhipuSession["turn_detection"] as? [String: Any])?["threshold"] as? Double == 0.15, "Zhipu keeps a low temperature and a threshold quiet speech can cross")
 check(!zhipuSetupText.contains("googleapis.com") && !zhipuSetupText.contains("models/"), "Zhipu session never carries a Google host or model path")
 let zhipuTools = (zhipuSession["tools"] as? [[String: Any]])?.map { $0["name"] as? String }
-check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["instructions"] as? String)?.contains("前进") == true && zhipuTools == ["drive", "run_scenario", "search_memory"], "Zhipu keeps the Gemini prompt and adds the car drive tool")
+check((zhipuSession["instructions"] as? String)?.contains("warm persona") == true && (zhipuSession["instructions"] as? String)?.contains("前进") == true && (zhipuSession["instructions"] as? String)?.contains("Do not pretend to search") == true && (zhipuSession["instructions"] as? String)?.contains("direction must be exactly") != true && zhipuTools == ["drive", "run_scenario", "search_memory"], "Zhipu keeps the counted drive prompt and does not pretend to search")
+check(((zhipuSession["tools"] as? [[String: Any]])?.first?["parameters"] as? [String: Any])?["required"] as? [String] == ["steps"], "drive tool requires steps rather than a bare direction")
 check(!zhipuSetupText.contains("OBJECT") && !zhipuSetupText.contains("nullable"), "Zhipu tool parameters are JSON Schema")
 let zhipuDefaultWire = try zhipuLive.liveWire()
 check(zhipuDefaultWire.encode(.video(Data([1]))).isEmpty, "default Zhipu session does not upload camera frames")
@@ -214,9 +216,9 @@ check(try zhipuEvents(#"{"type":"session.created"}"#).isEmpty, "Zhipu session.cr
 if case .toolCalls(let drive)? = try zhipuEvents(#"{"type":"response.function_call_arguments.done","name":"drive","arguments":{"direction":"前进"}}"#).first {
     check(drive.first?.name == "drive" && drive.first?.arguments?["direction"] as? String == "前进", "Zhipu drive arguments may already be an object")
 } else { check(false, "Zhipu drive arguments may already be an object") }
-if case .heard(let heardCommand)? = try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"user","content":[{"transcript":"前进"}]}}"#).first {
-    check(heardCommand == "前进", "Zhipu item transcript is a heard command")
-} else { check(false, "Zhipu item transcript is a heard command") }
+if case .heard(let heardCommand, let final)? = try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"user","content":[{"transcript":"前进"}]}}"#).first {
+    check(heardCommand == "前进" && final, "Zhipu item transcript is a final heard command")
+} else { check(false, "Zhipu item transcript is a final heard command") }
 check(try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"assistant","content":[{"transcript":"前进"}]}}"#).isEmpty, "assistant transcript is not a car command")
 check(try zhipuEvents(#"{"type":"conversation.item.created","item":{"role":"user","content":[{"transcript":null}]}}"#).isEmpty, "null Zhipu transcript is ignored")
 if case .toolCalls(let calls)? = try zhipuEvents(#"{"type":"response.function_call_arguments.done","name":"run_scenario","arguments":"{\"name\":\"wave\"}"}"#).first {

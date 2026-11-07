@@ -52,7 +52,8 @@ import GoogleSignIn
     var memoryAvailable: (() -> Bool)?
     var onMemorySearch: ((String) async throws -> [[String: Any]])?
     var onMemoryCancel: (() -> Void)?
-    var onScenario: ((String) async throws -> Void)?
+    var onAction: ((KariAction) async throws -> MotionExecutionReport)?
+    var onVoiceMotionBlocked: (() -> Void)?
     var onCancel: (() -> Void)?
     var onImmediateStop: (() -> Void)?
     private let audio = KariAudioOutput()
@@ -112,6 +113,13 @@ import GoogleSignIn
     private(set) var uploadsVideo = true
     private var lastMotionName: String?
     private var lastMotionAt = -Double.infinity
+    private var userTurn = 0
+    private var claimedPlan: (turn: Int, plan: MotionPlan)?
+    private var settledTurn = 0
+    private var turnArmed = false
+    private var turnTyped = false
+    private var freshUplinkSincePlan = false
+    private var lastVoicePlan: MotionPlan?
     private var localSpeech = false
     private var quietSince = 0.0
     private var utterancePeak = 0.0
@@ -229,6 +237,7 @@ import GoogleSignIn
                 self.send(.audio(data), token: token)
                 KariLiveTrace.sample("barge level=\(Int(level * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames)")
             case .upload:
+                self.noteTrustedUplink(level)
                 self.send(.audio(data), token: token)
                 self.finishVoiceTurnIfQuiet(level, token: token)
                 KariLiveTrace.sample("level=\(Int(level * 100)) peak=\(Int(self.utterancePeak * 100)) playing=\(self.speaking) upload=\(self.uploadedAudioFrames) commit=\(self.committedTurns) route=\(self.inputDescription)")
@@ -259,6 +268,7 @@ import GoogleSignIn
     func sendPCM(_ data: Data, level: Double = 0) {
         guard connected else { return }
         if speaking { peakMicrophoneDuringPlayback = max(peakMicrophoneDuringPlayback, level); microphoneFramesDuringPlayback += 1 }
+        noteTrustedUplink(level)
         // At most sixteen 500ms chunks for the bounded eight-second wake buffer.
         for offset in stride(from: 0, to: data.count, by: 16_000) {
             let chunk = data.subdata(in: offset..<min(data.count, offset + 16_000))
@@ -273,7 +283,17 @@ import GoogleSignIn
         for frame in wire.updateVideo(enabled) { enqueue(frame, token: generation) }
     }
     func sendFrame(_ jpeg: Data) { guard connected, uploadsVideo, queuedMessages < 6 else { return }; sentVideoFrames += 1; send(.video(jpeg), token: generation) }
-    func sendText(_ text: String) { guard connected else { return }; userUtterance = text; awaitingNewUserInput = false; processing = true; send(.text(text), token: generation) }
+    func sendText(_ text: String) {
+        guard connected else { return }
+        userTurn += 1
+        turnTyped = true
+        turnArmed = true
+        freshUplinkSincePlan = true
+        userUtterance = text
+        awaitingNewUserInput = false
+        processing = true
+        send(.text(text), token: generation)
+    }
     /// Voice-only audio is kept until this utterance falls well below its own peak.
     /// A fixed cutoff never arrives when the room itself stays above that cutoff.
     private func finishVoiceTurnIfQuiet(_ level: Double, token: Int) {
@@ -326,16 +346,27 @@ import GoogleSignIn
         switch event {
         case .ready: setupTimeout?.cancel(); let continuation = setup; setup = nil; continuation?.resume()
         case .resumable(let handle): resumeHandle = handle
+        // Playback stops. speech_started can be speaker echo, so this does not cancel an in-flight plan.
         case .interrupted: onMemoryCancel?(); serverInterruptions += 1; playbackGeneration += 1; audio.stop(); audioBuffers = 0; speaking = false; discardAudioUntilTurnComplete = false
-        case .heard(let text):
+        case .heard(let text, let final):
             serverNote = ""
             processing = true
-            if awaitingNewUserInput { userUtterance = ""; awaitingNewUserInput = false }
-            if userUtterance.count < 2000 { userUtterance += text }
+            if awaitingNewUserInput {
+                userTurn += 1
+                userUtterance = ""
+                awaitingNewUserInput = false
+                turnTyped = false
+                // Keep turnArmed. Trusted uplink for this utterance arrives before the transcript.
+            }
+            if acceptTranscript(text, final: final), userUtterance.count < 2000 { userUtterance += text }
             heard = String((heard + text).suffix(1500))
             if KariAIRequest.isStopRequest(text) { onImmediateStop?() }
-            else if let name = KariMemoryActionPolicy.scenario(for: text), claimMotion(name), let run = onScenario {
-                Task { try? await run(name) }
+            else if final, mayMove, let result = MotionPlan.parse(utterance: text), case .success(let plan) = result {
+                if admit(plan, trigger: .transcript) == .run { settledTurn = userTurn; start(plan) }
+            } else if final, !speaking, ProcessInfo.processInfo.systemUptime >= echoUntil, turnArmed || turnTyped,
+                      let name = KariMemoryActionPolicy.scenario(for: text), MotionPlan.parse(utterance: text) == nil,
+                      claimMotion(name), let run = onAction {
+                Task { try? await run(.scenario(name)) }
             }
         case .reply(let text): reply = String((reply + text).suffix(3000))
         case .audio(let pcm):
@@ -356,7 +387,10 @@ import GoogleSignIn
         case .turnComplete:
             awaitingNewUserInput = true; completedTurns += 1; turnComplete = true; processing = false; discardAudioUntilTurnComplete = false
             responseOpen = false
+            // PR6 keeps the 0.8s tail. settleTurn is the motion fallback, not acoustic cancellation.
             echoUntil = max(echoUntil, ProcessInfo.processInfo.systemUptime + 0.8)
+            settleTurn()
+            turnArmed = false
         case .toolCalls(let calls): runTools(calls, token: token)
         case .toolCancellation(let ids):
             cancelledToolIDs.formUnion(ids)
@@ -367,7 +401,7 @@ import GoogleSignIn
     private func runTools(_ calls: [KariLiveToolCall], token: Int) {
         for call in calls {
             if call.name == "search_memory" { memoryToolIDs.insert(call.id); memoryHasBeenUsed = true }
-            if call.name == "run_scenario" || call.name == "drive" { scenarioToolIDs.insert(call.id) }
+            if call.name == "run_scenario" || call.name == MotionPlan.toolName { scenarioToolIDs.insert(call.id) }
         }
         Task { [weak self] in
             guard let self else { return }; var results: [KariLiveToolResult] = []
@@ -380,15 +414,40 @@ import GoogleSignIn
                     if call.name == "search_memory" {
                         guard let query = args["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, query.count <= 2000, let search = self.onMemorySearch else { throw KariError.message("记忆检索参数无效") }
                         response["results"] = try await search(query)
-                    } else if call.name == "run_scenario" || call.name == "drive" {
-                        let raw = (call.name == "drive" ? args["direction"] : args["name"]) as? String ?? ""
-                        guard let name = KariMemoryActionPolicy.resolveToolScenario(raw), let run = self.onScenario else { throw KariError.message("不支持的说法，请说前进或后退") }
-                        guard !self.memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(self.userUtterance) else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
-                        if self.claimMotion(name) {
-                            try await run(name)
-                            let repeats = max(KariMemoryActionPolicy.requestedRepeats(raw), KariMemoryActionPolicy.requestedRepeats(self.userUtterance))
-                            if repeats > 1 { response["reason"] = "已执行一次，共请求 \(repeats) 次" }
-                        }
+                    } else if call.name == MotionPlan.toolName || call.name == "run_scenario" {
+                        guard self.mayMove else { throw KariError.message("资料问答不会执行动作，请单独下达动作指令") }
+                        guard let run = self.onAction else { throw KariError.message("未知动作请求") }
+                        if call.name == MotionPlan.toolName {
+                            let plan = try MotionPlan.parse(wire: args).get()
+                            switch self.admit(plan, trigger: .tool) {
+                            case .run:
+                                let report = try await run(.plan(plan))
+                                let reply = MotionToolReply.make(decision: .allow, report: report)
+                                response["ok"] = reply.ok
+                                response["executed"] = reply.executed ?? 0
+                                response["requested"] = reply.requested ?? plan.pulseCount
+                                if let reason = reply.reason { response["reason"] = reason }
+                            case .duplicate:
+                                if let reason = MotionToolReply.make(decision: .suppressDuplicate, report: nil).reason { response["reason"] = reason }
+                            case .conflict:
+                                throw KariError.message("这一句已经在执行另一组动作，小车不会再加动作")
+                            case .refused(let decision):
+                                let reply = MotionToolReply.make(decision: decision, report: nil)
+                                response["ok"] = reply.ok
+                                if let executed = reply.executed { response["executed"] = executed }
+                                if let reason = reply.reason { response["reason"] = reason }
+                            }
+                        } else if let name = KariMemoryActionPolicy.resolveToolScenario(args["name"] as? String ?? "") {
+                            let echoRisk = self.speaking || ProcessInfo.processInfo.systemUptime < self.echoUntil
+                            if !self.voiceTrusted { throw KariError.message("扬声器语音处理未开，已拒绝语音动作") }
+                            if echoRisk && !self.turnArmed && !self.turnTyped { response["reason"] = "回声期间不开始动作" }
+                            else if self.claimMotion(name) {
+                                let report = try await run(.scenario(name))
+                                response["executed"] = report.completed
+                                response["requested"] = report.requested
+                                if report.stopped { response["reason"] = "已停止，完成 \(report.completed)/\(report.requested)" }
+                            }
+                        } else { throw KariError.message("不支持的说法，请说前进或后退") }
                     } else { throw KariError.message("不支持的说法，请说前进或后退") }
                 } catch { response = ["ok": false, "reason": error.localizedDescription] }
                 self.memoryToolIDs.remove(call.id)
@@ -441,6 +500,58 @@ import GoogleSignIn
         }
         if clearResume { resumeHandle = nil; memoryHasBeenUsed = false }
         userUtterance = ""; awaitingNewUserInput = true; lastMotionName = nil; lastMotionAt = -Double.infinity
+        claimedPlan = nil; turnArmed = false; turnTyped = false; freshUplinkSincePlan = false; lastVoicePlan = nil
+    }
+    /// Trusted uplink is only `.upload`: playback and the 0.8s tail do not arm a plan.
+    private func noteTrustedUplink(_ level: Double) {
+        let disposition = LiveMicGate.disposition(speaking: speaking, responseOpen: responseOpen, now: ProcessInfo.processInfo.systemUptime, echoUntil: echoUntil)
+        guard disposition == .upload, level > 0.05, audio.voiceMotionTrusted else { return }
+        turnArmed = true
+        freshUplinkSincePlan = true
+    }
+    private var voiceTrusted: Bool { turnTyped || audio.voiceMotionTrusted }
+    private var mayMove: Bool { !memoryHasBeenUsed || KariMemoryActionPolicy.isDirectCommand(userUtterance) }
+    /// Playback and the PR6 tail never join the utterance, so settle cannot replay words the speaker just said.
+    private func acceptTranscript(_ text: String, final: Bool) -> Bool {
+        _ = (text, final)
+        return !speaking && ProcessInfo.processInfo.systemUptime >= echoUntil
+    }
+    private enum PlanAdmission: Equatable { case run, duplicate, conflict, refused(MotionStartDecision) }
+    private func admit(_ plan: MotionPlan, trigger: MotionTrigger) -> PlanAdmission {
+        let decision = MotionStartGate.decide(.init(
+            trigger: trigger, speaking: speaking, echoTail: ProcessInfo.processInfo.systemUptime < echoUntil,
+            voiceTrusted: voiceTrusted, turnArmed: turnArmed || turnTyped,
+            duplicateWithoutFreshUplink: lastVoicePlan == plan && !freshUplinkSincePlan))
+        guard decision == .allow else {
+            if decision == .rejectUntrustedVoice { onVoiceMotionBlocked?() }
+            return .refused(decision)
+        }
+        switch claim(plan) {
+        case .run:
+            lastVoicePlan = plan
+            freshUplinkSincePlan = false
+            return .run
+        case .echo: return .duplicate
+        case .conflict: return .conflict
+        }
+    }
+    private enum PlanClaim { case run, echo, conflict }
+    /// Transcript, drive, and the turn-end fallback share one plan per user turn.
+    private func claim(_ plan: MotionPlan) -> PlanClaim {
+        if let claimed = claimedPlan, claimed.turn == userTurn { return claimed.plan == plan ? .echo : .conflict }
+        claimedPlan = (userTurn, plan)
+        return .run
+    }
+    private func start(_ plan: MotionPlan) {
+        guard let run = onAction else { return }
+        Task { try? await run(.plan(plan)) }
+    }
+    private func settleTurn() {
+        let turn = userTurn, utterance = userUtterance
+        guard settledTurn != turn, claimedPlan?.turn != turn, !utterance.isEmpty, mayMove else { return }
+        settledTurn = turn
+        guard let result = MotionPlan.parse(utterance: utterance), case .success(let plan) = result else { return }
+        if admit(plan, trigger: .settle) == .run { start(plan) }
     }
     /// Tool calls and the transcript can both name the same move. A second copy inside this window is the echo, not a new command.
     private func claimMotion(_ name: String) -> Bool {
