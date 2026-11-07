@@ -122,13 +122,13 @@ struct MotionPlan: Equatable {
 
     static let toolDeclaration: [String: Any] = [
         "name": toolName,
-        "description": "Drive the car for one user request to go forward, back up, turn left, or turn right. Send the whole request as one ordered plan in a single call.",
+        "description": "Drive the car for one user request to go forward, back up, turn left, turn right, or turn one clockwise circle. Send the whole request in a single call. For a full circle, set spin and do not guess a pulse count.",
         "parameters": [
             "type": "OBJECT",
             "properties": [
                 "steps": [
                     "type": "ARRAY",
-                    "description": "Ordered steps, 1 to 8.",
+                    "description": "Ordered steps, 1 to 8. Send an empty array when spin is set; do not guess circle pulses here.",
                     "items": [
                         "type": "OBJECT",
                         "properties": [
@@ -137,13 +137,21 @@ struct MotionPlan: Equatable {
                         ],
                         "required": ["direction"]
                     ]
+                ],
+                "spin": [
+                    "type": "OBJECT",
+                    "description": "One clockwise full turn. The phone computes pulses from calibration. Do not include a pulse count.",
+                    "properties": [
+                        "sense": ["type": "STRING", "enum": ["clockwise"], "description": "Only clockwise."],
+                        "revolutions": ["type": "INTEGER", "description": "Only 1. Do not guess how many pulses make the circle."]
+                    ]
                 ]
             ],
             "required": ["steps"]
         ]
     ]
 
-    static let toolRule = "Use drive for 前进, 后退, 左转, and 右转. Use run_scenario for every other approved scenario."
+    static let toolRule = "Use drive for 前进, 后退, 左转, 右转, and one clockwise circle. Use run_scenario for every other approved scenario."
 
     static let modelInstruction = """
     <car_motion>
@@ -152,6 +160,7 @@ struct MotionPlan: Equatable {
     count is how many times to repeat that one small pulse. 步, 次, 下, and 回 are counts. 前进十步 and 后退10次 are [{"direction":"前进","count":10}] and [{"direction":"后退","count":10}]. 后退两回 is count 2. 前进两步再右转 is [{"direction":"前进","count":2},{"direction":"右转","count":1}]. Degrees and seconds are not counts, so 左转九十度 is count 1.
     Pass the number the user said even above 20. The phone refuses it, and then you tell the user why the car stayed still.
     The tool result field executed is how many pulses actually ran. Say that number. When executed is 0, do not claim the car moved.
+    A full circle is 转一圈, 转圈, spin, or spin once. Call drive once with {"steps":[],"spin":{"sense":"clockwise","revolutions":1}}. Do not guess how many pulses, steps, or degrees make that circle, and do not put a count inside spin. The phone expands it from calibration. If the tool result reason is 还没标定转一圈，请先在设置里标定, say that and do not claim the car turned. 左转一圈 and 转两圈 are outside this version; do not invent a plan for them.
     If you are unsure, say so directly. Do not pretend to search.
     </car_motion>
     """
@@ -160,6 +169,7 @@ struct MotionPlan: Equatable {
     Turn the user's request to drive a small car into JSON only, with no other text: {"steps":[{"direction":"前进","count":1}]}.
     direction is exactly 前进, 后退, 左转, or 右转. 往前进 and 向前进 are 前进. count repeats one small pulse and defaults to 1. 步, 次, 下, and 回 are counts. Degrees and seconds are not counts. Keep the user's order and the number they said.
     If the request is not about driving the car forward, back, left, or right, return {"steps":[]}.
+    For 转一圈, 转圈, spin, or spin once, return {"steps":[],"spin":{"sense":"clockwise","revolutions":1}} and do not guess a pulse count.
     """
 
     private static let phrases: [(String, MotionDirection)] = [

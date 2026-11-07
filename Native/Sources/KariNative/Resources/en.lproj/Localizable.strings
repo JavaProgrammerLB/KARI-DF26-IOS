@@ -843,6 +843,24 @@
 "记忆库不会自动记录聊天或音视频。" = "Memory does not automatically record chat, audio or video.";
 
 "资料问答不会执行动作，请单独下达动作指令" = "Document questions do not execute actions. Give a separate direct action command.";
+"标定转一圈" = "Calibrate a full turn";
+"小车会连续右转。你看到它转完一圈后点完成，手机会记住需要多少次。" = "The car keeps turning right. Tap Done when it has visually completed one circle. The phone remembers how many pulses that took.";
+"当前标定：%d 次右转为一圈" = "Calibrated: %d right pulses make one circle";
+"这次标定要 %d 次右转，一次最多 160 次，说「转一圈」时小车不会动。" = "This calibration needs %d right pulses. One command can run at most 160, so a full turn will not move the car.";
+"清除标定" = "Clear calibration";
+"还没标定。说「转一圈」之前需要先标定。" = "Not calibrated yet. Calibrate before asking for a full turn.";
+"已完成 %d 次右转" = "Completed %d right pulses";
+"取消标定" = "Cancel calibration";
+"已清除转一圈标定" = "Full-turn calibration cleared.";
+"请先结束陪伴，再标定转一圈" = "End companionship before calibrating a full turn.";
+"请先连接机器人，再标定转一圈" = "Connect the robot before calibrating a full turn.";
+"正在连续右转。目视转完一圈后点完成。" = "Turning right. Tap Done when the car has visually completed one circle.";
+"已标定转一圈：%@ 次右转。" = "Full turn calibrated: %@ right pulses.";
+"还没有完成一次右转，标定未保存。" = "No right pulse finished, so calibration was not saved.";
+"已取消标定转一圈。" = "Full-turn calibration cancelled.";
+"标定超过 %@ 次右转仍未点完成，已停止且未保存。" = "Calibration passed %@ right pulses without Done. It stopped and was not saved.";
+"正在结束当前这一下，然后保存标定。" = "Finishing the current pulse, then saving the calibration.";
+"还没标定转一圈，请先在设置里标定" = "A full turn is not calibrated yet. Calibrate it in Settings first.";
 "删除" = "Delete";
 "服务商" = "Provider";
 "模型" = "Model";

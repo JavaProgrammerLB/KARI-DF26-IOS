@@ -13,6 +13,11 @@ import Combine
     var zhipuVoice: Bool { settings.configuration.provider == "zhipu" && settings.configuration.isLive }
     @Published private(set) var recovering = false
     @Published private(set) var liveConnectionFailure = ""
+    @Published private(set) var turnCalibrating = false
+    @Published private(set) var turnCalibrationPulses = 0
+    /// Stops an unattended calibration ritual without saving. Not a default circle length.
+    private let turnCalibrationSafetyCap = 480
+    private var turnCalibrationFinish = false
     private let liveStarter: ((KariAIConfiguration) async throws -> Void)?
     var liveFailure: String { settings.configuration.isLive ? (live.error.isEmpty ? liveConnectionFailure : live.error) : "" }
     let memory: KariMemoryService
@@ -108,6 +113,8 @@ import Combine
             return try await task.value
         }
         live.onVoiceMotionBlocked = { [weak self] in self?.notice = "扬声器语音处理未开，已拒绝语音动作" }
+        live.turnCalibration = { [weak self] in self?.settings.turnCalibration }
+        live.onChassisNotice = { [weak self] text in self?.notice = text }
         live.onCancel = { [weak self] in self?.cancelActivePlan() }
         live.onImmediateStop = { [weak self] in self?.stopBodyImmediately() }
         body.onFault = { [weak self] text in
@@ -187,6 +194,7 @@ import Combine
     }
     func stop() async {
         token = UUID(); planEpoch += 1; planTask?.cancel(); operation?.cancel(); memory.invalidateQuery()
+        turnCalibrating = false; turnCalibrationFinish = false
         textOperation?.cancel(); textToken = UUID(); phase = .stopping
         recovering = false; wake.stop(); companion.end(); remote.close()
         live.stop(); camera.stop(); face.cancel(); settings.motionEnabled = false; textBusy = false; scenarioBusy = false
@@ -432,6 +440,86 @@ import Combine
             guard current == token else { return }; settings.motionEnabled = false; phase = .idle
         }
     }
+    func beginTurnCalibration() {
+        guard phase == .idle, !isBusy else { notice = "请先结束陪伴，再标定转一圈"; return }
+        guard body.isConnected else { notice = "请先连接机器人，再标定转一圈"; return }
+        phase = .testing
+        token = UUID()
+        let current = token
+        turnCalibrating = true
+        turnCalibrationPulses = 0
+        turnCalibrationFinish = false
+        notice = "正在连续右转。目视转完一圈后点完成。"
+        operation = Task {
+            var completed = 0
+            var failure: String?
+            let lease: MotionLease
+            do { lease = try await motion.acquire(.test) }
+            catch {
+                guard current == token else { return }
+                notice = error.localizedDescription
+                turnCalibrating = false
+                phase = .idle
+                return
+            }
+            let id = UUID().uuidString
+            sceneID = id; sceneLease = lease; scenarioBusy = true
+            defer {
+                motion.release(lease)
+                if sceneID == id { sceneID = nil; sceneLease = nil; scenarioBusy = false }
+            }
+            while !Task.isCancelled, current == token, !turnCalibrationFinish, completed < turnCalibrationSafetyCap {
+                do { try await face.run("look_right", allowMotion: true, runID: id) }
+                catch {
+                    if !motion.valid(lease) || Task.isCancelled || current != token { break }
+                    failure = error.localizedDescription
+                    break
+                }
+                guard current == token, !Task.isCancelled else { break }
+                completed += 1
+                turnCalibrationPulses = completed
+            }
+            if motion.valid(lease) { _ = await motion.stop() }
+            guard current == token else { return }
+            let capped = !turnCalibrationFinish && failure == nil && completed >= turnCalibrationSafetyCap
+            if turnCalibrationFinish, failure == nil, let calibration = TurnPulseCalibration.measured(samplePulses: completed, at: Date()) {
+                settings.saveTurnCalibration(calibration)
+                notice = "已标定转一圈：\(completed) 次右转。"
+            } else if turnCalibrationFinish, completed == 0 {
+                notice = "还没有完成一次右转，标定未保存。"
+            } else if let failure {
+                notice = failure
+            } else if capped {
+                notice = "标定超过 \(turnCalibrationSafetyCap) 次右转仍未点完成，已停止且未保存。"
+            } else {
+                notice = "已取消标定转一圈。"
+            }
+            turnCalibrating = false
+            turnCalibrationFinish = false
+            phase = .idle
+        }
+    }
+    func finishTurnCalibration() {
+        guard turnCalibrating, !turnCalibrationFinish else { return }
+        turnCalibrationFinish = true
+        notice = "正在结束当前这一下，然后保存标定。"
+    }
+    func cancelTurnCalibration() {
+        guard turnCalibrating else { return }
+        turnCalibrationFinish = false
+        token = UUID()
+        operation?.cancel()
+        face.cancel()
+        let current = token
+        Task {
+            _ = await motion.stop()
+            guard current == token else { return }
+            turnCalibrating = false
+            turnCalibrationPulses = 0
+            if phase == .testing { phase = .idle }
+            notice = "已取消标定转一圈。"
+        }
+    }
     func testMotion() {
         guard phase == .idle, !isBusy, body.isConnected else { notice = "请先连接自己的机器人，再结束陪伴进行测试"; return }
         phase = .testing; let current = UUID(); token = current
@@ -507,10 +595,11 @@ import Combine
     @discardableResult func sendText(_ text: String, includeImage: Bool = false) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         if KariAIRequest.isStopRequest(text) { companion.interact(); stopBodyImmediately(); return true }
-        let typedPlan = live.connected ? nil : MotionPlan.parse(utterance: text)
-        switch typedPlan {
-        case .success(let plan)? where phase == .active: Task { try? await perform(.plan(plan)) }
-        case .failure(let error)?: notice = error.localizedDescription
+        let typedResolution = live.connected ? nil : ChassisIntent.resolve(utterance: text, calibration: settings.turnCalibration)
+        switch typedResolution {
+        case .plan(let plan)? where phase == .active: Task { try? await perform(.plan(plan)) }
+        case .needsCalibration?: notice = ChassisIntent.needsCalibrationMessage
+        case .refused(let reason)?: notice = reason
         case nil where !live.connected:
             if let name = KariMemoryActionPolicy.scenario(for: text), phase == .active { Task { try? await runScenario(name) } }
         default: break
@@ -530,7 +619,7 @@ import Combine
                 let raw = try await textRequest(text, image: image, allowActions: true, useMemory: true)
                 guard current == token, messageToken == textToken else { return }
                 let reply = KariAIRequest.companionReply(raw, allowedScenarios: scenarioNames); textReply = reply.text
-                if let scenario = reply.scenario, typedPlan == nil, phase == .active {
+                if let scenario = reply.scenario, typedResolution == nil, phase == .active {
                     guard !memory.hasEnabledDocuments || KariMemoryActionPolicy.isDirectCommand(text) else {
                         textReply = L("资料问答不会执行动作，请单独下达动作指令"); return
                     }
