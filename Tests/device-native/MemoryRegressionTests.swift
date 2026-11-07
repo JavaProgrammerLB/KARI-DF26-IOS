@@ -150,7 +150,9 @@ final class MemoryRegressionTests: XCTestCase {
         XCTAssertNil(KariMemoryActionPolicy.resolveToolScenario("前进是什么意思？"))
         XCTAssertEqual(KariMemoryActionPolicy.scenario(for: "往前进"), "come_closer")
         XCTAssertEqual(KariMemoryActionPolicy.resolveToolScenario("后退10次"), "back_up")
-        XCTAssertEqual(KariMemoryActionPolicy.requestedRepeats("后退10次"), 10)
+        if case .success(let counted)? = MotionPlan.parse(utterance: "后退10次") { XCTAssertEqual(counted.pulseCount, 10) } else { XCTFail("后退10次") }
+        if case .success(let twice)? = MotionPlan.parse(utterance: "后退两回") { XCTAssertEqual(twice.pulseCount, 2) } else { XCTFail("后退两回") }
+        if case .success(let ahead)? = MotionPlan.parse(utterance: "向前进") { XCTAssertEqual(ahead.steps.first?.direction, .forward) } else { XCTFail("向前进") }
     }
 
 }

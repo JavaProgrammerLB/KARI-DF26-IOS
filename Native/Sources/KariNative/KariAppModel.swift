@@ -35,6 +35,8 @@ import Combine
     }, stop: { [weak self] in await self?.motion.manualStop() ?? false })
     private var subscriptions = Set<AnyCancellable>()
     private var operation: Task<Void, Never>?
+    private var planTask: Task<MotionExecutionReport, Error>?
+    private var planEpoch = 0
     private var textOperation: Task<Void, Never>?
     private var textToken = UUID()
     private var token = UUID()
@@ -98,15 +100,15 @@ import Combine
             guard let self else { throw CancellationError() }
             return try await self.sendBodyCommand(payload, runID: runID)
         }
-        live.onScenario = { [weak self] name in
+        live.onAction = { [weak self] action in
             guard let self, self.phase == .active else { throw KariError.message("陪伴尚未开始") }
             guard !self.remote.presented else { throw KariError.message("手动遥控中，AI 身体动作已暂停") }
-            try await self.runScenario(name)
+            let task = Task { try await self.perform(action) }
+            self.planTask = task
+            return try await task.value
         }
-        live.onCancel = { [weak self] in
-            self?.motion.invalidate(); guard self?.remote.presented != true else { return }
-            Task { _ = await self?.motion.stop() }
-        }
+        live.onVoiceMotionBlocked = { [weak self] in self?.notice = "扬声器语音处理未开，已拒绝语音动作" }
+        live.onCancel = { [weak self] in self?.cancelActivePlan() }
         live.onImmediateStop = { [weak self] in self?.stopBodyImmediately() }
         body.onFault = { [weak self] text in
             guard let self else { return }; self.remote.connectionLost(reason: text)
@@ -121,6 +123,9 @@ import Combine
     }
     private func updateFace() { face.state(connected: body.isConnected, speaking: live.speaking, thinking: live.connecting, cameraRunning: camera.running) }
     private func stopBodyImmediately() {
+        planEpoch += 1
+        face.cancel()
+        planTask?.cancel()
         settings.motionEnabled = false; companion.cancelAutomatic(); motion.invalidate()
         if remote.presented { remote.emergencyStop(); notice = "手动遥控已停止"; return }
         Task { let confirmed = await motion.stop(); notice = confirmed ? "身体动作已停止，语音陪伴可继续。" : "停止指令未获确认，请检查机器人。" }
@@ -181,7 +186,7 @@ import Combine
         }
     }
     func stop() async {
-        token = UUID(); operation?.cancel(); memory.invalidateQuery()
+        token = UUID(); planEpoch += 1; planTask?.cancel(); operation?.cancel(); memory.invalidateQuery()
         textOperation?.cancel(); textToken = UUID(); phase = .stopping
         recovering = false; wake.stop(); companion.end(); remote.close()
         live.stop(); camera.stop(); face.cancel(); settings.motionEnabled = false; textBusy = false; scenarioBusy = false
@@ -302,6 +307,56 @@ import Combine
             settings.motionEnabled = true
         } else {
             stopBodyImmediately()
+        }
+    }
+    private func cancelActivePlan() {
+        planEpoch += 1
+        face.cancel()
+        planTask?.cancel()
+        motion.invalidate()
+        guard !remote.presented else { return }
+        Task { _ = await motion.stop() }
+    }
+    func perform(_ action: KariAction) async throws -> MotionExecutionReport {
+        if let plan = action.motionPlan { return try await run(plan) }
+        if case .scenario(let name) = action {
+            try await runScenario(name)
+            return MotionExecutionReport(requested: 1, completed: 1, stopped: false)
+        }
+        return MotionExecutionReport(requested: 0, completed: 0, stopped: false)
+    }
+    private func run(_ plan: MotionPlan) async throws -> MotionExecutionReport {
+        guard !remote.presented, !companion.follow.enabled else { throw PolicyError.busy }
+        let started = planEpoch
+        let requested = plan.pulseCount
+        guard MotionRunControl.beginAllowed(epochAtStart: started, epochNow: planEpoch) else {
+            return MotionExecutionReport(requested: requested, completed: 0, stopped: true)
+        }
+        let lease = try await motion.acquire(.explicit)
+        let id = UUID().uuidString
+        sceneID = id; sceneLease = lease; scenarioBusy = true
+        defer { motion.release(lease); if sceneID == id { sceneID = nil; sceneLease = nil; scenarioBusy = false } }
+        guard MotionRunControl.pulseAllowed(epochAtStart: started, epochNow: planEpoch, leaseValid: motion.valid(lease)),
+              phase == .active, settings.motionEnabled, body.isConnected else {
+            if motion.valid(lease) { _ = await motion.stop() }
+            return MotionExecutionReport(requested: requested, completed: 0, stopped: true)
+        }
+        var completed = 0
+        do {
+            for step in plan.steps {
+                for _ in 0..<step.count.value {
+                    try Task.checkCancellation()
+                    guard MotionRunControl.pulseAllowed(epochAtStart: started, epochNow: planEpoch, leaseValid: motion.valid(lease)),
+                          phase == .active, settings.motionEnabled, body.isConnected else { throw PolicyError.cancelled }
+                    try await face.run(step.direction.scenario, allowMotion: true, runID: id)
+                    completed += 1
+                }
+            }
+            _ = try await motion.send(["type": "stop"], lease: lease)
+            return MotionExecutionReport(requested: requested, completed: completed, stopped: false)
+        } catch {
+            if motion.valid(lease) { _ = await motion.stop() }
+            return MotionExecutionReport(requested: requested, completed: completed, stopped: true)
         }
     }
     func runScenario(_ name: String, manual: Bool = false, source: MotionSource = .explicit, allowBody: Bool = true) async throws {
@@ -452,7 +507,14 @@ import Combine
     @discardableResult func sendText(_ text: String, includeImage: Bool = false) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         if KariAIRequest.isStopRequest(text) { companion.interact(); stopBodyImmediately(); return true }
-        if let name = KariMemoryActionPolicy.scenario(for: text), phase == .active { Task { try? await runScenario(name) } }
+        let typedPlan = live.connected ? nil : MotionPlan.parse(utterance: text)
+        switch typedPlan {
+        case .success(let plan)? where phase == .active: Task { try? await perform(.plan(plan)) }
+        case .failure(let error)?: notice = error.localizedDescription
+        case nil where !live.connected:
+            if let name = KariMemoryActionPolicy.scenario(for: text), phase == .active { Task { try? await runScenario(name) } }
+        default: break
+        }
         if companion.wakeSettings.enabled && settings.configuration.isLive && !wake.mayUpload { notice = "请先唤醒，再发送消息"; return false }
         companion.interact()
         if live.connected { live.sendText(text); return true }
@@ -468,11 +530,11 @@ import Combine
                 let raw = try await textRequest(text, image: image, allowActions: true, useMemory: true)
                 guard current == token, messageToken == textToken else { return }
                 let reply = KariAIRequest.companionReply(raw, allowedScenarios: scenarioNames); textReply = reply.text
-                if let scenario = reply.scenario, phase == .active {
+                if let scenario = reply.scenario, typedPlan == nil, phase == .active {
                     guard !memory.hasEnabledDocuments || KariMemoryActionPolicy.isDirectCommand(text) else {
                         textReply = L("资料问答不会执行动作，请单独下达动作指令"); return
                     }
-                    try await runScenario(scenario)
+                    try await perform(.scenario(scenario))
                 }
             }
             catch { if current == token && messageToken == textToken { notice = error.localizedDescription } }

@@ -145,12 +145,16 @@ enum KariEmbeddingURL {
 enum KariMemoryActionPolicy {
     static func isDirectCommand(_ text: String) -> Bool {
         guard text.count <= 240 else { return false }
+        if MotionPlan.parse(utterance: text) != nil { return true }
         let value = normalized(text)
         let chinese = "^(?:你好卡里|嘿卡里|kari|卡里)?(?:请你|请|帮我|给我|麻烦你)?(?:往前进|向前进|往前走|往后走|往后退|向后退|向前走|向后走|往左转|往右转|向左转|向右转|前进|后退|往前|往后|向前|向后|往左|往右|向左|向右|左转|右转|转一圈|转圈|跳舞|动一动|做个动作|打个招呼|眨眨眼|眨眼|笑一下|开心一点)(?:一下|一点|一会儿|两步|一次|一圈|[0-9一二两三四五六七八九十]+(?:秒|度|步|次|下|回))?(?:吧|好吗|可以吗)?$"
         let english = "^(?:heykari|kari)?(?:please)?(?:moveforward|goforward|movebackward|gobackward|turnleft|turnright|spin|dance|wave|blink|smile)(?:abit|alittle|once|for[0-9]+seconds?)?(?:please)?$"
         return value.range(of: chinese, options: .regularExpression) != nil || value.range(of: english, options: .regularExpression) != nil
     }
     static func scenario(for text: String) -> String? {
+        if let result = MotionPlan.parse(utterance: text), case .success(let plan) = result, plan.steps.count == 1 {
+            return plan.steps[0].direction.scenario
+        }
         guard isDirectCommand(text) else { return nil }
         let value = normalized(text)
         let commands = [("往前进", "come_closer"), ("向前进", "come_closer"),
@@ -159,15 +163,6 @@ enum KariMemoryActionPolicy {
                         ("往左转", "look_left"), ("向左转", "look_left"), ("往左", "look_left"), ("向左", "look_left"), ("左转", "look_left"), ("turnleft", "look_left"),
                         ("往右转", "look_right"), ("向右转", "look_right"), ("往右", "look_right"), ("向右", "look_right"), ("右转", "look_right"), ("turnright", "look_right")]
         return commands.first { value.contains($0.0) }?.1
-    }
-    /// How many times the speaker asked to repeat. The runtime still performs the move once.
-    static func requestedRepeats(_ text: String) -> Int {
-        let value = normalized(text)
-        guard let range = value.range(of: "([0-9]{1,3}|[一二两三四五六七八九]|十)(?:次|下|回)", options: .regularExpression) else { return 1 }
-        let token = String(value[range].dropLast())
-        if let number = Int(token), number > 0 { return number }
-        let digits = ["一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10]
-        return digits[token] ?? 1
     }
     private static func normalized(_ text: String) -> String {
         text.lowercased().filter { !$0.isWhitespace && !"，。！？,.!?:：".contains($0) }
